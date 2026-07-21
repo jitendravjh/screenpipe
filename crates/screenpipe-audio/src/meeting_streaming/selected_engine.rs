@@ -81,7 +81,7 @@ async fn run_stream(
     // preview stays current instead of falling behind and dropping frames.
     let handoff = Arc::new(Mutex::new(LiveHandoff::default()));
     let notify = Arc::new(Notify::new());
-    let transcriber = tokio::spawn(transcribe_loop(
+    let mut transcriber = tokio::spawn(transcribe_loop(
         handoff.clone(),
         notify.clone(),
         session,
@@ -95,6 +95,10 @@ async fn run_stream(
     let mut buffer = LiveChunkBuffer::default();
     let mut resampler: Option<StreamResampler> = None;
     let mut flush_tick = interval(FLUSH_TICK);
+
+    // Set once the transcriber exits on its own (a transcribe failure), so we
+    // don't await the handle a second time below.
+    let mut transcriber_outcome: Option<Result<()>> = None;
 
     loop {
         tokio::select! {
@@ -132,18 +136,38 @@ async fn run_stream(
                     publish_chunk(&mut buffer, &handoff, &notify);
                 }
             }
+            outcome = &mut transcriber => {
+                // The transcriber only returns while frames are still flowing when
+                // a transcribe fails. Stop ingesting and let that error propagate so
+                // the controller un-suppresses batch recording and restarts the stream.
+                transcriber_outcome = Some(join_transcriber(outcome));
+                break;
+            }
         }
     }
 
-    handoff.lock().unwrap().closed = true;
-    notify.notify_one();
-    let _ = transcriber.await;
+    let outcome = match transcriber_outcome {
+        Some(outcome) => outcome,
+        None => {
+            handoff.lock().unwrap().closed = true;
+            notify.notify_one();
+            join_transcriber(transcriber.await)
+        }
+    };
+    outcome?;
 
     info!(
         "meeting streaming: selected-engine live stream ended (meeting_id={}, device={})",
         meeting_id, device_name
     );
     Ok(())
+}
+
+fn join_transcriber(joined: Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match joined {
+        Ok(outcome) => outcome,
+        Err(err) => Err(anyhow!("live transcription task ended unexpectedly: {err}")),
+    }
 }
 
 /// Single-slot hand-off from the ingestion loop to the transcription task. Only
@@ -174,7 +198,7 @@ async fn transcribe_loop(
     device_name: String,
     device_type: String,
     model: Option<String>,
-) {
+) -> Result<()> {
     let mut sequence: u64 = 0;
     loop {
         let next = {
@@ -183,7 +207,7 @@ async fn transcribe_loop(
         };
         match next {
             (Some(chunk), _) => {
-                if let Err(err) = transcribe_chunk(
+                transcribe_chunk(
                     chunk,
                     &mut session,
                     &config,
@@ -193,18 +217,13 @@ async fn transcribe_loop(
                     model.clone(),
                     &mut sequence,
                 )
-                .await
-                {
-                    warn!(
-                        "meeting streaming: selected-engine live transcription failed (meeting_id={}, device={}): {:?}",
-                        meeting_id, device_name, err
-                    );
-                }
+                .await?;
             }
             (None, true) => break,
             (None, false) => notify.notified().await,
         }
     }
+    Ok(())
 }
 
 async fn selected_engine_session(
