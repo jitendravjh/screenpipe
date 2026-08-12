@@ -150,7 +150,9 @@ fn forced_language(language: Option<&str>) -> Option<Language> {
     match code.parse::<Language>() {
         Ok(language) => Some(language),
         Err(err) => {
-            warn!("meeting streaming: ignoring unknown live transcription language {code:?}: {err}");
+            warn!(
+                "meeting streaming: ignoring unknown live transcription language {code:?}: {err}"
+            );
             None
         }
     }
