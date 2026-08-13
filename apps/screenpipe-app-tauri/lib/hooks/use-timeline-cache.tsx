@@ -171,6 +171,14 @@ export async function clearTimelineCache(): Promise<void> {
   } catch (error) {
     console.warn("Failed to clear timeline cache:", error);
   }
+
+  try {
+    await localforage
+      .createInstance({ name: "screenpipe", storeName: "timeline_cache" })
+      .clear();
+  } catch (error) {
+    console.warn("Failed to clear legacy timeline cache:", error);
+  }
 }
 
 /**
