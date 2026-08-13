@@ -33,7 +33,11 @@ const SLIDE_WINDOW_SIZES: Record<SlideKey, { width: number; height: number }> =
   {
     login: { width: 500, height: 480 },
     acquisition: { width: 500, height: 560 },
-    permissions: { width: 500, height: 560 },
+    // Taller than the other 560 slides: the wheel now sits under the data dir
+    // chip and above the pause note, and at 560 the note was clipped by the
+    // window edge (caught by the trust-affordance E2E screenshot, which is why
+    // that spec asserts the note is inside the viewport).
+    permissions: { width: 500, height: 660 },
     timeline: { width: 500, height: 680 },
     engine: { width: 500, height: 620 },
     plan: { width: 760, height: 720 },
@@ -165,6 +169,17 @@ export default function OnboardingPage() {
       : "unknown";
   const shouldShowPlanSelection =
     !isManagedDeployment && user?.has_payment_method !== true;
+  // "plan" is the last slide, so auto-advancing onto it without a token traps
+  // the user in onboarding: PlanSelectionStep can neither load embedded
+  // checkout (it renders "sign in to continue") nor start the cardless trial,
+  // and handleNextSlide stops calling completeOnboarding once a next slide
+  // exists. Someone who skipped sign-in would sit on /onboarding forever.
+  //
+  // This gates only the automatic walk out of the engine slide. The slide stays
+  // in visibleOrder — and so in the progress total and the restore mapping — so
+  // navigating to it directly still renders card capture.
+  const canAdvanceIntoPlanSelection =
+    shouldShowPlanSelection && Boolean(user?.token);
   const visibleOrder = useMemo(
     () =>
       SLIDE_ORDER.filter(
@@ -353,8 +368,10 @@ export default function OnboardingPage() {
     // for a slide that policy hides, then land on the next visible slide.
     // Consumer onboarding ends on plan selection after the engine is ready.
     // Managed deployments skip that consumer purchase surface.
-    const nextSlide = SLIDE_ORDER.slice(currentIdx + 1).find((s) =>
-      visibleOrder.includes(s),
+    const nextSlide = SLIDE_ORDER.slice(currentIdx + 1).find(
+      (s) =>
+        visibleOrder.includes(s) &&
+        (s !== "plan" || canAdvanceIntoPlanSelection),
     );
     if (!nextSlide) {
       await completeOnboarding({ method: "setup_finished" });
@@ -376,6 +393,7 @@ export default function OnboardingPage() {
       setIsTransitioning(false);
     }, 300);
   }, [
+    canAdvanceIntoPlanSelection,
     completeOnboarding,
     currentSlide,
     deviceTierForAnalytics,
