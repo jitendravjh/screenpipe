@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use screenpipe_core::Language;
 use tokio::{
     sync::{mpsc, RwLock},
     task::JoinHandle,
@@ -29,6 +28,35 @@ const LIVE_CHUNK_TARGET: Duration = Duration::from_secs(6);
 const LIVE_CHUNK_MIN: Duration = Duration::from_secs(2);
 const FLUSH_TICK: Duration = Duration::from_millis(750);
 const MIN_LIVE_RMS: f32 = 0.003;
+// Only lock the session language from a chunk with enough speech to detect it
+// reliably; a 2s min-tick chunk is too short to trust.
+const LANGUAGE_LOCK_MIN_SAMPLES: usize = (LIVE_SAMPLE_RATE * 3) as usize;
+
+/// Stabilizes the decoding language for a local live session. With no configured
+/// language, Whisper re-detects every short chunk and can flip scripts mid-meeting
+/// (issue #5650); this locks the first confident detection so the rest of the
+/// session stays consistent, mirroring the cloud path's stable language.
+struct LiveLanguageLock {
+    enabled: bool,
+    locked: bool,
+}
+
+impl LiveLanguageLock {
+    fn new(unconstrained: bool) -> Self {
+        Self {
+            enabled: unconstrained,
+            locked: false,
+        }
+    }
+
+    fn wants_detection(&self) -> bool {
+        self.enabled && !self.locked
+    }
+
+    fn lock(&mut self) {
+        self.locked = true;
+    }
+}
 
 pub fn spawn_selected_engine_stream(
     config: MeetingStreamingConfig,
@@ -74,8 +102,9 @@ async fn run_stream(
 ) -> Result<()> {
     // Bias the local live transcriber toward this meeting's keyterms (user
     // vocabulary + calendar attendee names) by seeding the session vocabulary.
-    let mut session = selected_engine_session(&engine_ref, &config).await?;
+    let mut session = selected_engine_session(&engine_ref, &config.keyterms).await?;
     let model = selected_engine_model(&session);
+    let mut language_lock = LiveLanguageLock::new(session.live_language_is_unconstrained());
     let mut buffer = LiveChunkBuffer::default();
     let mut resampler: Option<StreamResampler> = None;
     let mut flush_tick = interval(FLUSH_TICK);
@@ -90,7 +119,7 @@ async fn run_stream(
                             buffer.push(tail, Utc::now().timestamp_millis() as u64);
                         }
                     }
-                    flush_buffer(&mut buffer, &mut session, &config, meeting_id, &device_name, &device_type, model.clone(), &mut sequence).await?;
+                    flush_buffer(&mut buffer, &mut session, &mut language_lock, &config, meeting_id, &device_name, &device_type, model.clone(), &mut sequence).await?;
                     break;
                 };
 
@@ -101,12 +130,12 @@ async fn run_stream(
                 }
                 buffer.push(samples, frame.captured_at_unix_ms);
                 if buffer.duration() >= LIVE_CHUNK_TARGET {
-                    flush_buffer(&mut buffer, &mut session, &config, meeting_id, &device_name, &device_type, model.clone(), &mut sequence).await?;
+                    flush_buffer(&mut buffer, &mut session, &mut language_lock, &config, meeting_id, &device_name, &device_type, model.clone(), &mut sequence).await?;
                 }
             }
             _ = flush_tick.tick() => {
                 if buffer.duration() >= LIVE_CHUNK_MIN {
-                    flush_buffer(&mut buffer, &mut session, &config, meeting_id, &device_name, &device_type, model.clone(), &mut sequence).await?;
+                    flush_buffer(&mut buffer, &mut session, &mut language_lock, &config, meeting_id, &device_name, &device_type, model.clone(), &mut sequence).await?;
                 }
             }
         }
@@ -121,7 +150,7 @@ async fn run_stream(
 
 async fn selected_engine_session(
     engine_ref: &Arc<RwLock<Option<TranscriptionEngine>>>,
-    config: &MeetingStreamingConfig,
+    keyterms: &[String],
 ) -> Result<TranscriptionSession> {
     let engine = engine_ref
         .read()
@@ -135,25 +164,7 @@ async fn selected_engine_session(
         ));
     }
 
-    let mut session = engine.create_session_with_keyterms(&config.keyterms)?;
-    // The cloud live path forces the configured language; the local path must
-    // too, or Whisper auto-detects per short chunk and garbles non-english
-    // speech into the wrong script (issue #5650).
-    if let Some(language) = forced_language(config.language.as_deref()) {
-        session.set_language(language);
-    }
-    Ok(session)
-}
-
-fn forced_language(language: Option<&str>) -> Option<Language> {
-    let code = language.map(str::trim).filter(|s| !s.is_empty())?;
-    match code.parse::<Language>() {
-        Ok(language) => Some(language),
-        Err(err) => {
-            warn!("meeting streaming: ignoring unknown live transcription language {code:?}: {err}");
-            None
-        }
-    }
+    engine.create_session_with_keyterms(keyterms)
 }
 
 fn selected_engine_model(session: &TranscriptionSession) -> Option<String> {
@@ -180,6 +191,7 @@ fn selected_engine_model(session: &TranscriptionSession) -> Option<String> {
 async fn flush_buffer(
     buffer: &mut LiveChunkBuffer,
     session: &mut TranscriptionSession,
+    language_lock: &mut LiveLanguageLock,
     config: &MeetingStreamingConfig,
     meeting_id: i64,
     device_name: &str,
@@ -194,6 +206,16 @@ async fn flush_buffer(
     if rms(&chunk.samples) < MIN_LIVE_RMS {
         debug!("meeting streaming: selected-engine live chunk was silent; skipping");
         return Ok(());
+    }
+
+    // Lock the session language on the first chunk long enough to judge, so the
+    // rest of the meeting stops re-detecting and flipping scripts (issue #5650).
+    if language_lock.wants_detection() && chunk.samples.len() >= LANGUAGE_LOCK_MIN_SAMPLES {
+        if let Some(language) = session.detect_live_language(&chunk.samples) {
+            info!("meeting streaming: locking live transcription language to {language}");
+            session.set_language(language);
+            language_lock.lock();
+        }
     }
 
     let transcript = session
@@ -371,11 +393,13 @@ mod tests {
     }
 
     #[test]
-    fn forced_language_resolves_configured_language() {
-        assert_eq!(forced_language(Some("ru")), Some(Language::Russian));
-        assert_eq!(forced_language(Some("russian")), Some(Language::Russian));
-        assert_eq!(forced_language(Some("  ")), None);
-        assert_eq!(forced_language(None), None);
-        assert_eq!(forced_language(Some("klingon")), None);
+    fn language_lock_only_wants_detection_while_enabled_and_unlocked() {
+        let mut lock = LiveLanguageLock::new(true);
+        assert!(lock.wants_detection());
+        lock.lock();
+        assert!(!lock.wants_detection());
+
+        // A session that already has a configured language never detects.
+        assert!(!LiveLanguageLock::new(false).wants_detection());
     }
 }

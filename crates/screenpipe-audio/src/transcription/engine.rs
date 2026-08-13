@@ -619,6 +619,29 @@ impl TranscriptionSession {
         }
     }
 
+    /// Whether this session leaves the decoding language unconstrained: a local
+    /// Whisper session with no configured language, which re-detects every chunk.
+    /// The live path uses this to decide whether to lock onto a detected language.
+    pub fn live_language_is_unconstrained(&self) -> bool {
+        matches!(self, Self::Whisper { languages, .. } if languages.is_empty())
+    }
+
+    /// Detect this chunk's language for a local Whisper session so the live path
+    /// can pin it for the rest of the session. Returns `None` for engines that
+    /// resolve language elsewhere, or when the audio is too quiet to judge.
+    pub fn detect_live_language(&mut self, audio: &[f32]) -> Option<Language> {
+        let Self::Whisper {
+            state, languages, ..
+        } = self
+        else {
+            return None;
+        };
+        crate::transcription::whisper::batch::detect_whisper_language(audio, languages, state)
+            .ok()
+            .flatten()
+            .and_then(|code| code.parse::<Language>().ok())
+    }
+
     pub async fn transcribe_detailed(
         &mut self,
         audio: &[f32],
@@ -981,5 +1004,22 @@ mod merge_keyterms_tests {
             }
             _ => panic!("expected deepgram session"),
         }
+    }
+
+    #[test]
+    fn only_local_whisper_is_language_unconstrained() {
+        // Cloud/remote engines resolve language server-side, so live language
+        // locking is a Whisper-only concern even with an empty language list.
+        let deepgram = TranscriptionSession::Deepgram {
+            config: DeepgramTranscriptionConfig {
+                endpoint: String::new(),
+                auth_token: String::new(),
+                auth_header_prefix: "Token",
+            },
+            languages: vec![],
+            vocabulary: vec![],
+        };
+        assert!(!deepgram.live_language_is_unconstrained());
+        assert!(!TranscriptionSession::Disabled.live_language_is_unconstrained());
     }
 }
