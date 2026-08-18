@@ -206,7 +206,7 @@ export function StorageSection() {
                   setCacheFiles(result.data);
                   setShowCacheDialog(true);
                 } catch (e: any) {
-                  toast({ title: "failed to scan cache", description: e?.toString(), variant: "destructive" });
+                  toast({ title: "failed to clear cache", description: e?.toString(), variant: "destructive" });
                 }
               }}
             >

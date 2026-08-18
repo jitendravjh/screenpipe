@@ -99,4 +99,23 @@ describe("StorageSection clear cache", () => {
     );
     expect(mocks.clearTimelineCache).not.toHaveBeenCalled();
   });
+
+  it("does not claim success when timeline cache deletion fails", async () => {
+    mocks.listCacheFiles.mockResolvedValue({ status: "ok", data: [] });
+    mocks.hasCachedData.mockResolvedValue(true);
+    mocks.clearTimelineCache.mockRejectedValueOnce(new Error("permission denied"));
+
+    render(<StorageSection />);
+    fireEvent.click(screen.getByRole("button", { name: /^clear$/i }));
+
+    await waitFor(() =>
+      expect(mocks.toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "failed to clear cache",
+          variant: "destructive",
+        }),
+      ),
+    );
+    expect(mocks.toast).not.toHaveBeenCalledWith({ title: "cache cleared" });
+  });
 });
