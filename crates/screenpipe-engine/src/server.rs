@@ -38,8 +38,9 @@ use crate::{
         },
         elements::{get_frame_elements, search_elements},
         frames::{
-            get_frame_context, get_frame_data, get_frame_metadata, get_frame_text_data,
-            get_frame_thumbnail, get_next_valid_frame, run_frame_ocr, FrameThumbnailCache,
+            get_frame_context, get_frame_data, get_frame_metadata, get_frame_preview_media,
+            get_frame_preview_samples, get_frame_text_data, get_frame_thumbnail,
+            get_next_valid_frame, run_frame_ocr, FrameThumbnailCache,
         },
         health::{
             api_list_monitors, api_vision_status, audio_metrics_handler, health_check,
@@ -888,6 +889,11 @@ impl SCServer {
             .post("/tags/vision/batch", get_tags_batch)
             .post("/tags/:content_type/:id", add_tags)
             .delete("/tags/:content_type/:id", remove_tags)
+            .get("/frames/preview-samples", get_frame_preview_samples)
+            .get(
+                "/frames/preview-media/:video_chunk_id",
+                get_frame_preview_media,
+            )
             .get("/frames/:frame_id", get_frame_data)
             .get("/frames/:frame_id/thumbnail", get_frame_thumbnail)
             .get("/frames/:frame_id/text", get_frame_text_data)
@@ -962,6 +968,26 @@ impl SCServer {
             .get("/frames/:frame_id/elements", get_frame_elements)
             .get("/activity-summary", get_activity_summary)
             .get("/activity-ledger", get_activity_ledger)
+            .get(
+                "/cloud-agents/status",
+                crate::routes::cloud_agents::cloud_agent_status,
+            )
+            .post(
+                "/cloud-agents/:provider/connect",
+                crate::routes::cloud_agents::connect_cloud_agent,
+            )
+            .get(
+                "/cloud-agents/cursor-agents",
+                crate::routes::cloud_agents::list_cursor_cloud_agents,
+            )
+            .get(
+                "/cloud-agents/:provider/codebases",
+                crate::routes::cloud_agents::list_cloud_agent_codebases,
+            )
+            .put(
+                "/cloud-agents/cursor-key",
+                crate::routes::cloud_agents::set_cursor_cloud_key,
+            )
             // Vault routes
             .get("/vault/status", crate::routes::vault::vault_status)
             .post("/vault/lock", crate::routes::vault::vault_lock)
@@ -1014,6 +1040,21 @@ impl SCServer {
         // Build the main router with all routes
         let router = Router::new()
             .merge(server.into_router())
+            // Agent self-improvement lives behind one validated local API so
+            // native Pi and ACP share profile safety, prompt rendering, skill
+            // provenance, optimistic concurrency, and bundled protection.
+            .route(
+                "/agent/skills/manage",
+                axum::routing::post(crate::agent_skills::manage_agent_skill_handler),
+            )
+            .route(
+                "/agent/profile/manage",
+                axum::routing::post(crate::agent_profile::manage_profile_handler),
+            )
+            .route(
+                "/agent/self-improvement/context",
+                axum::routing::get(crate::agent_profile::self_improvement_context_handler),
+            )
             // Renderer-agnostic structured outputs are deliberately outside
             // the public OpenAPI surface for now. Consumers define targets;
             // authenticated pipes can discover and fill only their bindings.

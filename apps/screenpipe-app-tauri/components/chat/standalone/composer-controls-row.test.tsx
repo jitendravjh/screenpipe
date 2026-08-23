@@ -21,19 +21,26 @@ const newPreset: AIPreset = {
 vi.mock("@/components/rewind/ai-presets-selector", () => ({
   AIPresetsSelector: ({
     onControlledSelect,
+    popoverFooter,
   }: {
     onControlledSelect: (preset: AIPreset) => void;
+    popoverFooter?: React.ReactNode;
   }) => (
-    <button type="button" onClick={() => onControlledSelect(newPreset)}>
-      finish creating preset
-    </button>
+    <>
+      <button type="button" onClick={() => onControlledSelect(newPreset)}>
+        finish creating preset
+      </button>
+      {popoverFooter}
+    </>
   ),
 }));
 vi.mock("@/components/chat/standalone/composer-utility-menu", () => ({
   ComposerUtilityMenu: () => null,
 }));
 vi.mock("@/components/chat/standalone/acp-config-selector", () => ({
-  AcpConfigSelector: () => null,
+  AcpConfigSelector: ({ agentId }: { agentId: string }) => (
+    <div data-testid="mock-acp-config">{agentId}</div>
+  ),
 }));
 vi.mock("@/components/chat/standalone/acp-permission-selector", () => ({
   AcpPermissionSelector: ({ agentId }: { agentId: string }) => (
@@ -41,15 +48,66 @@ vi.mock("@/components/chat/standalone/acp-permission-selector", () => ({
   ),
 }));
 vi.mock("@/components/thinking-level-selector", () => ({
-  ThinkingLevelSelector: () => null,
+  ThinkingLevelSelector: ({ embedded }: { embedded?: boolean }) => (
+    <div data-testid={embedded ? "mock-inline-effort" : "mock-effort-trigger"} />
+  ),
 }));
 vi.mock("@/components/usage/usage-popover", () => ({
-  UsagePopover: () => null,
+  UsagePopover: ({
+    activePreset,
+    sessionId,
+  }: {
+    activePreset?: AIPreset | null;
+    sessionId: string | null;
+  }) => (
+    <div data-testid="mock-usage-preset">
+      {activePreset?.id ?? "none"}|{sessionId ?? "none"}
+    </div>
+  ),
 }));
 
 import { ComposerControlsRow } from "./composer-controls-row";
 
-describe("ComposerControlsRow preset selection", () => {
+describe("ComposerControlsRow", () => {
+  it("uses an upward arrow for the send action", () => {
+    render(
+      <ComposerControlsRow
+        canChat
+        filters={
+          {
+            activeFilterCount: 0,
+            activeFilters: [],
+            activeFilterLabels: [],
+            hasActiveFilters: false,
+            appFilterOpen: false,
+            onFilterMenuOpenChange: vi.fn(),
+          } as any
+        }
+        modelControls={{
+          settings: { aiPresets: [] },
+          activePreset: null,
+          activePipeExecution: null,
+          currentQueueSessionId: null,
+          onSelectPreset: vi.fn(),
+          onPresetSaved: vi.fn(),
+        }}
+        isStreaming={false}
+        sendButton={{
+          isStopMode: false,
+          hasPendingDocs: false,
+          sendDisabled: false,
+          onStop: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(
+      screen
+        .getByRole("button", { name: "send message" })
+        .querySelector(".lucide-arrow-up"),
+    ).toBeInTheDocument();
+  });
+
   it("activates and restarts with a newly created preset absent from the stale settings list", () => {
     const onSelectPreset = vi.fn();
     const onPresetSaved = vi.fn();
@@ -57,14 +115,16 @@ describe("ComposerControlsRow preset selection", () => {
     render(
       <ComposerControlsRow
         canChat
-        filters={{
+        filters={
+          {
             activeFilterCount: 0,
             activeFilters: [],
             activeFilterLabels: [],
             hasActiveFilters: false,
             appFilterOpen: false,
             onFilterMenuOpenChange: vi.fn(),
-        } as any}
+          } as any
+        }
         modelControls={{
           settings: {
             aiPresets: [
@@ -92,13 +152,15 @@ describe("ComposerControlsRow preset selection", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "finish creating preset" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "finish creating preset" }),
+    );
 
     expect(onSelectPreset).toHaveBeenCalledWith(newPreset);
     expect(onPresetSaved).toHaveBeenCalledWith(newPreset);
   });
 
-  it("shares the permission control across ACP presets only", () => {
+  it("uses one model and effort surface for ACP and native presets", () => {
     const commonProps = {
       canChat: true,
       filters: {
@@ -139,6 +201,13 @@ describe("ComposerControlsRow preset selection", () => {
     expect(screen.getByTestId("mock-acp-permission")).toHaveTextContent(
       "codex-acp",
     );
+    expect(screen.getByTestId("mock-acp-config")).toHaveTextContent(
+      "codex-acp",
+    );
+    expect(screen.queryByTestId("mock-inline-effort")).not.toBeInTheDocument();
+    expect(screen.getByTestId("mock-usage-preset")).toHaveTextContent(
+      "codex|chat-1",
+    );
 
     rerender(
       <ComposerControlsRow
@@ -161,24 +230,50 @@ describe("ComposerControlsRow preset selection", () => {
     expect(screen.getByTestId("mock-acp-permission")).toHaveTextContent(
       "claude-acp",
     );
-
-    rerender(
-      <ComposerControlsRow
-        {...commonProps}
-        modelControls={{
-          settings: { aiPresets: [] },
-          activePreset: {
-            id: "cloud",
-            provider: "openai-chatgpt",
-          } as AIPreset,
-          activePipeExecution: null,
-          currentQueueSessionId: "chat-1",
-          onSelectPreset: vi.fn(),
-          onPresetSaved: vi.fn(),
-        }}
-      />,
+    expect(screen.getByTestId("mock-acp-config")).toHaveTextContent(
+      "claude-acp",
+    );
+    expect(screen.getByTestId("mock-usage-preset")).toHaveTextContent(
+      "claude|chat-1",
     );
 
-    expect(screen.queryByTestId("mock-acp-permission")).not.toBeInTheDocument();
+    const nativeProviders: AIPreset["provider"][] = [
+      "screenpipe-cloud",
+      "openai",
+      "openai-chatgpt",
+      "anthropic",
+      "custom",
+      "native-ollama",
+      "pi",
+    ];
+
+    for (const provider of nativeProviders) {
+      rerender(
+        <ComposerControlsRow
+          {...commonProps}
+          modelControls={{
+            settings: { aiPresets: [] },
+            activePreset: {
+              id: provider,
+              provider,
+            } as AIPreset,
+            activePipeExecution: null,
+            currentQueueSessionId: "chat-1",
+            onSelectPreset: vi.fn(),
+            onPresetSaved: vi.fn(),
+          }}
+        />,
+      );
+
+      expect(
+        screen.queryByTestId("mock-acp-permission"),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByTestId("mock-acp-config")).not.toBeInTheDocument();
+      expect(screen.getByTestId("mock-inline-effort")).toBeInTheDocument();
+      expect(screen.queryByTestId("mock-effort-trigger")).not.toBeInTheDocument();
+      expect(screen.getByTestId("mock-usage-preset")).toHaveTextContent(
+        `${provider}|chat-1`,
+      );
+    }
   });
 });

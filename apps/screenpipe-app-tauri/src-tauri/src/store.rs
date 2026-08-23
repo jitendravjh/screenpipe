@@ -1008,6 +1008,10 @@ pub struct SettingsStore {
     /// When disabled, users must click "update now" in the tray menu.
     #[serde(rename = "autoUpdate", default = "default_true")]
     pub auto_update: bool,
+    /// Consumer updater channel selected on this device. Older stores omit it
+    /// and therefore remain on the stable channel.
+    #[serde(rename = "updateChannel", default = "default_update_channel")]
+    pub update_channel: String,
     /// Auto-update store-installed pipes that haven't been locally modified.
     #[serde(rename = "autoUpdatePipes", default = "default_true")]
     pub auto_update_pipes: bool,
@@ -1103,6 +1107,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_update_channel() -> String {
+    "stable".to_string()
+}
+
 fn default_overlay_size() -> String {
     "small".to_string()
 }
@@ -1166,6 +1174,13 @@ pub struct AcpAgentPresetConfig {
     /// Default session mode id, applied after every session/new.
     #[serde(default)]
     pub mode_id: Option<String>,
+    /// Screenpipe-owned ACP permission response policy (`ask` or `allow-all`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    /// Send this agent's model calls through Screenpipe Cloud. `None` keeps
+    /// presets saved before this choice on the agent's own provider account.
+    #[serde(default)]
+    pub use_screenpipe_cloud: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -1606,6 +1621,7 @@ Rules:
             allow_hiding_shortcut_overlay: false,
             device_id: uuid::Uuid::new_v4().to_string(),
             auto_update: true,
+            update_channel: default_update_channel(),
             auto_update_pipes: true,
             enhanced_ai: false,
             remote_log_collection_enabled: false,
@@ -2638,6 +2654,17 @@ mod tests {
     #[test]
     fn auto_update_defaults_to_enabled() {
         assert!(SettingsStore::default().auto_update);
+    }
+
+    #[test]
+    fn update_channel_defaults_to_stable_for_old_stores() {
+        assert_eq!(SettingsStore::default().update_channel, "stable");
+
+        let missing: SettingsStore = serde_json::from_value(json!({
+            "aiPresets": []
+        }))
+        .unwrap();
+        assert_eq!(missing.update_channel, "stable");
     }
 
     #[test]
@@ -4076,6 +4103,26 @@ mod tests {
         let preset = &sanitized_acp["aiPresets"][0];
         assert_eq!(preset["provider"].as_str(), Some("acp"));
         assert_eq!(preset["acpAgent"]["id"].as_str(), Some("codex-acp"));
+    }
+
+    #[test]
+    fn acp_cloud_billing_route_survives_preset_persistence() {
+        let preset: AIPreset = serde_json::from_value(json!({
+            "id": "claude code",
+            "provider": "acp",
+            "model": "claude-acp",
+            "acpAgent": {
+                "id": "claude-acp",
+                "useScreenpipeCloud": true
+            }
+        }))
+        .expect("ACP preset should deserialize");
+
+        let persisted = serde_json::to_value(preset).expect("ACP preset should serialize");
+        assert_eq!(
+            persisted["acpAgent"]["useScreenpipeCloud"].as_bool(),
+            Some(true)
+        );
     }
 
     /// The exact shape an ACP-unaware build leaves behind: provider rewritten

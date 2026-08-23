@@ -41,9 +41,11 @@ const mocks = vi.hoisted(() => {
       stopScreenpipe: vi.fn(async () => undefined),
       spawnScreenpipe: vi.fn(async () => undefined),
       setEnterprisePolicy: vi.fn(async () => undefined),
+      setEnterpriseRecordingAuthorized: vi.fn(async () => ({ status: "ok", data: null })),
       applyEnterpriseUiVisibility: vi.fn(async () => undefined),
       setSyncStreams: vi.fn(async () => undefined),
       saveEnterpriseTeamConfig: vi.fn(async () => null),
+      syncManagedTeamSkills: vi.fn(async () => ({ status: "ok" as const, data: [] })),
     },
     tauriFetch: vi.fn(),
     localFetch: vi.fn(),
@@ -225,9 +227,14 @@ describe("enterprise policy runtime manual activation", () => {
     mocks.commands.stopScreenpipe.mockResolvedValue(undefined);
     mocks.commands.spawnScreenpipe.mockResolvedValue(undefined);
     mocks.commands.setEnterprisePolicy.mockResolvedValue(undefined);
+    mocks.commands.setEnterpriseRecordingAuthorized.mockResolvedValue({
+      status: "ok",
+      data: null,
+    });
     mocks.commands.applyEnterpriseUiVisibility.mockResolvedValue(undefined);
     mocks.commands.setSyncStreams.mockResolvedValue(undefined);
     mocks.commands.saveEnterpriseTeamConfig.mockResolvedValue(null);
+    mocks.commands.syncManagedTeamSkills.mockResolvedValue({ status: "ok", data: [] });
     mocks.platform.mockReturnValue("windows");
   });
 
@@ -265,12 +272,70 @@ describe("enterprise policy runtime manual activation", () => {
     view.unmount();
   });
 
+  it("installs an explicitly returned organization skill in local AI agents", async () => {
+    mocks.commands.getEnterpriseLicenseKey.mockResolvedValue(KEY);
+    const managedSkills = [
+      {
+        artifact_id: "meeting-follow-up",
+        version: 3,
+        release_version: 1,
+        name: "Meeting follow-up",
+        description: "Turn a completed meeting into traceable next steps.",
+        package: {
+          format: "agentskills.io/v1",
+          package_version: 1,
+          entrypoint: "SKILL.md",
+          digest: "a".repeat(64),
+          name: "meeting-follow-up",
+          description: "Turn a completed meeting into traceable next steps.",
+          files: [
+            {
+              path: "SKILL.md",
+              content: "---\nname: meeting-follow-up\ndescription: Turn a completed meeting into traceable next steps.\n---\n",
+              sha256: "b".repeat(64),
+              bytes: 106,
+            },
+          ],
+          context: { discovery_chars: 76, activation_chars: 106 },
+          risk: { has_scripts: false },
+        },
+        destinations: ["screenpipe", "claude-code", "codex", "gemini"],
+      },
+    ];
+    mockEnterpriseApi({ policy: { managedSkills } });
+
+    const { result } = await renderEnterprisePolicy();
+
+    await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
+    await waitFor(() =>
+      expect(mocks.commands.syncManagedTeamSkills).toHaveBeenCalledWith(
+        managedSkills,
+        true,
+      ),
+    );
+  });
+
+  it("preserves installed organization skills when the policy field is omitted", async () => {
+    mocks.commands.getEnterpriseLicenseKey.mockResolvedValue(KEY);
+    mockEnterpriseApi({});
+
+    const { result } = await renderEnterprisePolicy();
+
+    await waitFor(() => expect(result.current.isEnterpriseAuthenticated).toBe(true));
+    expect(mocks.commands.syncManagedTeamSkills).not.toHaveBeenCalled();
+  });
+
   it("offers credential choice when neither account nor saved key exists", async () => {
     const { result } = await renderEnterprisePolicy();
 
     await waitFor(() => expect(result.current.authenticationState).toBe("choice"));
     expect(result.current.isEnterpriseAuthenticated).toBe(false);
     expect(mocks.tauriFetch).not.toHaveBeenCalled();
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(
+      false,
+      null,
+      null,
+    );
   });
 
   it("verifies an existing saved key and authenticates automatically", async () => {
@@ -286,6 +351,11 @@ describe("enterprise policy runtime manual activation", () => {
     expect(policyCall?.[1]?.headers["X-License-Key"]).toBe(KEY);
     expect(policyCall?.[1]?.headers.Authorization).toBeUndefined();
     expect(mocks.commands.saveEnterpriseLicenseKey).not.toHaveBeenCalled();
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(
+      true,
+      "license_key",
+      KEY,
+    );
   });
 
   it("pushes explicit startup enforcement to Rust and applies it live", async () => {
@@ -405,6 +475,11 @@ describe("enterprise policy runtime manual activation", () => {
 
     expect(activation).toEqual({ ok: false, error: "invalid enterprise key" });
     expect(mocks.commands.saveEnterpriseLicenseKey).not.toHaveBeenCalled();
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(
+      false,
+      null,
+      null,
+    );
   });
 
   it("shows a distinct error for an expired key", async () => {
@@ -451,8 +526,35 @@ describe("enterprise policy runtime manual activation", () => {
 
     expect(activation).toEqual({ ok: true });
     expect(mocks.commands.saveEnterpriseLicenseKey).toHaveBeenCalledWith(KEY);
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(
+      true,
+      "license_key",
+      KEY,
+    );
     expect(result.current.isEnterpriseAuthenticated).toBe(true);
     expect(result.current.policy.orgName).toBe("Bungalow");
+  });
+
+  it("does not publish authenticated state when the native recording grant fails", async () => {
+    mockEnterpriseApi({});
+    const { result } = await renderEnterprisePolicy();
+    mocks.commands.setEnterpriseRecordingAuthorized.mockResolvedValueOnce({
+      status: "error",
+      error: "command unavailable",
+    } as never);
+
+    let activation!: Awaited<ReturnType<typeof result.current.submitLicenseKey>>;
+    await act(async () => {
+      activation = await result.current.submitLicenseKey(KEY);
+    });
+
+    expect(activation).toEqual({
+      ok: false,
+      error:
+        "enterprise access was verified, but recording could not be enabled - check enrollment, seat availability, and your connection, then try again",
+    });
+    expect(mocks.commands.saveEnterpriseLicenseKey).toHaveBeenCalledWith(KEY);
+    expect(result.current.isEnterpriseAuthenticated).toBe(false);
   });
 
   it("sends only X-License-Key for key authentication", async () => {
@@ -512,6 +614,11 @@ describe("enterprise policy runtime manual activation", () => {
     expect(accountHeartbeatCall?.[1]?.headers.Authorization).toBe("Bearer account-token");
     expect(accountHeartbeatCall?.[1]?.headers["X-License-Key"]).toBeUndefined();
     expect(mocks.commands.saveEnterpriseLicenseKey).not.toHaveBeenCalled();
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(
+      true,
+      "account",
+      "account-token",
+    );
   });
 
   it("rejects a signed-in account when the API denies membership", async () => {
@@ -523,6 +630,11 @@ describe("enterprise policy runtime manual activation", () => {
     await waitFor(() => expect(result.current.authenticationState).toBe("account"));
     expect(result.current.isEnterpriseAuthenticated).toBe(false);
     expect(result.current.authenticationError).toMatch(/not associated/i);
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenCalledWith(
+      false,
+      null,
+      null,
+    );
   });
 
   it("does not wait for a hanging engine restart during activation", async () => {
@@ -635,7 +747,7 @@ describe("enterprise policy runtime manual activation", () => {
       ([url, init]) =>
         String(url).includes("/api/enterprise/policy") &&
         init?.headers?.Authorization === "Bearer account-token" &&
-        init?.headers?.["X-License-Key"] === undefined
+        init?.headers?.["X-License-Key"] === KEY
     );
     expect(accountPolicyCall).toBeDefined();
   });
@@ -648,7 +760,10 @@ describe("enterprise policy runtime manual activation", () => {
       init?: { headers?: Record<string, string> }
     ) => {
       if (url.includes("/api/enterprise/policy")) {
-        if (init?.headers?.["X-License-Key"] === KEY) {
+        if (
+          init?.headers?.["X-License-Key"] === KEY &&
+          init?.headers?.Authorization === undefined
+        ) {
           return new Response(JSON.stringify({ error: "bad credential" }), {
             status: 401,
           });
@@ -667,7 +782,7 @@ describe("enterprise policy runtime manual activation", () => {
         ([url, init]) =>
           String(url).includes("/api/enterprise/policy") &&
           init?.headers?.Authorization === "Bearer account-token" &&
-          init?.headers?.["X-License-Key"] === undefined
+          init?.headers?.["X-License-Key"] === KEY
       )
     ).toBe(true);
   });
@@ -702,6 +817,11 @@ describe("enterprise policy runtime manual activation", () => {
     expect(result.current.authenticationState).toBe("account");
     expect(result.current.isEnterpriseAuthenticated).toBe(false);
     expect(result.current.authenticationError).toMatch(/requires signing in/i);
+    expect(mocks.commands.setEnterpriseRecordingAuthorized).toHaveBeenLastCalledWith(
+      false,
+      null,
+      null,
+    );
   }, 20_000);
 
   it("bounds the initial policy request with a deadline and a connect timeout", async () => {
@@ -1054,7 +1174,7 @@ describe("enterprise policy runtime manual activation", () => {
         ([url, init]) =>
           String(url).includes("/api/enterprise/policy") &&
           init?.headers?.Authorization === "Bearer account-token" &&
-          init?.headers?.["X-License-Key"] === undefined
+          init?.headers?.["X-License-Key"] === KEY
       );
     expect(accountPolicyCall).toBeDefined();
   }, 20_000);

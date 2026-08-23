@@ -44,9 +44,12 @@ import {
   isConversationHistorySyncPrompt,
   isInjectedTitleSourcePrompt,
   normalizeComposerMentionsForModel,
-  type ComposerCommandId,
   type ComposerSkillReference,
 } from "@/lib/chat-utils";
+import {
+  runComposerCommand,
+  type ComposerCommandId,
+} from "@/lib/composer-commands";
 import {
   useAutoSuggestions,
   type Suggestion,
@@ -107,7 +110,10 @@ import {
   parseAgentActionRequest,
   stripAgentActionBlocks,
 } from "@/lib/chat/agent-action-card";
-import { useChatStore } from "@/lib/stores/chat-store";
+import {
+  ensureBlankChatSession,
+  useChatStore,
+} from "@/lib/stores/chat-store";
 import { AGENT_TOPICS, type AgentEventEnvelope } from "@/lib/events/types";
 import { listenTyped, TAURI_EVENTS } from "@/lib/events/tauri-events";
 import { localFetch } from "@/lib/api";
@@ -138,6 +144,7 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
 export function StandaloneChat({
   className,
   hideInlineHistory,
+  chatShortcutsEnabled = true,
   sidebarCollapsed,
   firstRunLearningEnabled = false,
 }: {
@@ -153,6 +160,10 @@ export function StandaloneChat({
    *  chat at `/chat` leaves it false so users still have a history
    *  affordance in the floating window — that window has no AppSidebar. */
   hideInlineHistory?: boolean;
+  /** Main-window tabs stay mounted behind Timeline, Meetings, and other
+   * sections so background work can continue. This flag keeps tab-only
+   * shortcuts scoped to the visible chat surface while that layer is hidden. */
+  chatShortcutsEnabled?: boolean;
   /** When true, the app sidebar is collapsed — used to apply traffic-light
    *  padding on the chat header since the sidebar no longer covers them. */
   sidebarCollapsed?: boolean;
@@ -254,6 +265,8 @@ export function StandaloneChat({
     setChipScrollTop,
     clearConnectionChip,
   } = useChatComposerShell();
+  const [homeCardPromptPreview, setHomeCardPromptPreview] =
+    useState<string | null>(null);
   // Holds the exact text a contextual starter put in the composer, so the send
   // can tell "sent the starter as-is" from "reworked it into their own
   // question". The second is the outcome the experiment is actually testing —
@@ -261,6 +274,7 @@ export function StandaloneChat({
   const pendingContextualHomeSuggestionRef = useRef<string | null>(null);
   const fillContextualHomeSuggestion = useCallback(
     (text: string) => {
+      setHomeCardPromptPreview(null);
       pendingContextualHomeSuggestionRef.current = text;
       setInput(text);
       requestAnimationFrame(() => {
@@ -271,7 +285,11 @@ export function StandaloneChat({
     [inputRef, setInput],
   );
   useEffect(() => {
-    if (!input.trim()) pendingContextualHomeSuggestionRef.current = null;
+    if (!input.trim()) {
+      pendingContextualHomeSuggestionRef.current = null;
+      return;
+    }
+    setHomeCardPromptPreview(null);
   }, [input]);
   useTryInChatEvent({
     startNewRef: tryInChatStartNewRef,
@@ -283,7 +301,7 @@ export function StandaloneChat({
   // their messages from the chat store instead — see the `messages` derivation
   // below, after `conversationId` is known.
   const [localMessages, setMessages] = useState<Message[]>([]);
-  // One dialog for every ACP sign-in — CLI login (Kimi, OpenCode) and
+  // One dialog for every ACP sign-in — CLI login (Cursor, Kimi, OpenCode) and
   // in-protocol auth-method selection alike. Single piece of state → deduped.
   const [acpSignIn, setAcpSignIn] = useState<AcpSignInRequest | null>(null);
   // A CLI retry is in flight: we re-attempted the connection and are waiting to
@@ -329,13 +347,21 @@ export function StandaloneChat({
   // chat before any message: the live session (if one exists) is updated by the
   // selector separately, and a not-yet-started session reads these defaults.
   const handleAcpConfigDefault = useCallback(
-    (change: { optionId?: string; value?: string; modeId?: string }) => {
+    (change: {
+      optionId?: string;
+      value?: string;
+      modeId?: string;
+      approvalMode?: "ask" | "allow-all";
+    }) => {
       const preset = activePresetRef.current;
       const agent = preset?.acpAgent;
       if (!preset || !agent) return;
       const nextAgent = { ...agent };
       if (change.modeId !== undefined) {
         nextAgent.modeId = change.modeId;
+      }
+      if (change.approvalMode !== undefined) {
+        nextAgent.approvalMode = change.approvalMode;
       }
       if (change.optionId !== undefined && change.value !== undefined) {
         nextAgent.config = { ...(agent.config ?? {}), [change.optionId]: change.value };
@@ -681,6 +707,7 @@ export function StandaloneChat({
   useEffect(() => {
     const store = useChatStore.getState();
     if (!store.currentId) {
+      ensureBlankChatSession(store, initialSessionIdRef.current);
       store.actions.setCurrent(initialSessionIdRef.current);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -842,6 +869,7 @@ export function StandaloneChat({
     saveConversation,
     loadConversation,
     deleteConversation,
+    archiveConversation,
     renameConversation,
     startNewConversation,
     branchConversation,
@@ -928,10 +956,12 @@ export function StandaloneChat({
     piStreamingTextRef,
     piMessageIdRef,
     piContentBlocksRef,
+    piStartInFlightRef,
     forceQueueModeRef,
     sendDispatchInFlightRef,
     setIsLoading,
     setIsStreaming,
+    setPiStarting,
   });
   useChatWindowSyncEvents({
     aiPresets: settings?.aiPresets,
@@ -986,7 +1016,6 @@ export function StandaloneChat({
     appItems,
     allConnectionItems,
     connections,
-    piStarting,
     piInfo,
     setPiInfo,
     isStreaming,
@@ -1195,23 +1224,15 @@ export function StandaloneChat({
 
   // Render assignment, matching openMentionConversationRef above: every handler
   // a `/` command needs is defined by this point.
-  runComposerCommandRef.current = async (commandId: ComposerCommandId) => {
-    switch (commandId) {
-      case "new-chat":
-        await startNewConversationRef.current?.();
-        return;
-      case "stop":
-        await handleStop();
-        return;
-      case "inspector":
-        toggleInspector();
-        return;
-      case "pipes":
+  runComposerCommandRef.current = (commandId: ComposerCommandId) =>
+    runComposerCommand(commandId, {
+      startNewChat: () => startNewConversationRef.current?.(),
+      stopResponse: handleStop,
+      toggleInspector,
+      openScheduledTasks: async () => {
         await commands.showWindow({ Home: { page: "pipes" } });
-        return;
-    }
-  };
-
+      },
+    });
 
   const answerPiExtensionUiRequest = useCallback(async (
     requestId: string | undefined,
@@ -1631,7 +1652,7 @@ export function StandaloneChat({
       setAcpSignIn({ kind: "cli", ...info });
       setAcpSignInError(
         wasChecking
-          ? `still not signed in to ${info.agentName}. run the command below in a terminal, then retry.`
+          ? `still not signed in to ${info.agentName}. try signing in again.`
           : null,
       );
     },
@@ -1806,13 +1827,11 @@ export function StandaloneChat({
     }
     setAcpSignInBusy(false);
   }, []);
-  // "i've signed in, retry": re-attempt the connection and report the outcome
-  // in the dialog. First a hard check that the CLI is even installed (a clear,
-  // actionable error if not). Then reconnect: acp_ready closes the dialog and
-  // resends the pending message; acp_external_auth_required re-fires as a red
-  // "still not signed in" error; a timeout guards the case where neither comes
-  // back. The dialog stays open throughout, so the user always sees what
-  // happened instead of it silently closing or spinning forever.
+  // Re-attempt the connection after the agent-owned login exits. First a hard
+  // check that the CLI is installed, then reconnect: acp_ready closes the
+  // dialog and resends the pending message; acp_external_auth_required re-fires
+  // as a red "still not signed in" error; a timeout guards the case where
+  // neither comes back.
   const handleAcpRetry = useCallback(() => {
     // Works for both the CLI-login card and the "use my login" row of the
     // method picker: re-attempt the connection after the user signed in.
@@ -1845,7 +1864,7 @@ export function StandaloneChat({
       acpSignInTimeoutRef.current = window.setTimeout(() => {
         if (!acpSignInBusyRef.current) return;
         clearAcpSignInProbe();
-        setAcpSignInError(`couldn't reach ${agentName}. make sure you ran the command, then retry.`);
+        setAcpSignInError(`couldn't reach ${agentName}. try signing in again.`);
       }, 25_000);
 
       // Trigger a fresh connection. A pending message rides along on success;
@@ -1860,6 +1879,31 @@ export function StandaloneChat({
       }
     })();
   }, [acpSignIn, clearAcpSignInProbe, lastUserMessageRef, piMessageIdRef, sendMessage, buildProviderConfig, restartCurrentPiSession]);
+  // External-login agents such as Cursor own their OAuth flow. Launch the
+  // reviewed catalog command hidden as the desktop user; the CLI opens the
+  // browser, stores its own credential, and exits. Then reconnect automatically
+  // instead of asking the user to copy a command and click retry.
+  const handleAcpCliSignIn = useCallback(() => {
+    if (acpSignIn?.kind !== "cli") return;
+    const { agentId, agentName } = acpSignIn;
+    setAcpSignInError(null);
+    setAcpSignInBusy(true);
+    acpSignInBusyRef.current = true;
+    void (async () => {
+      try {
+        const result = await commands.piAcpExternalLogin(agentId);
+        if (result.status === "error") throw new Error(result.error);
+        // The dialog may have been dismissed while the browser was open.
+        if (!acpSignInBusyRef.current) return;
+        handleAcpRetry();
+      } catch (error) {
+        if (!acpSignInBusyRef.current) return;
+        clearAcpSignInProbe();
+        const detail = error instanceof Error ? error.message : String(error);
+        setAcpSignInError(`couldn't open ${agentName}'s login: ${detail}`);
+      }
+    })();
+  }, [acpSignIn, clearAcpSignInProbe, handleAcpRetry]);
   // "switch to default": fall back to the default preset and resend there.
   // Safe to close immediately — the default provider won't re-trigger the
   // agent's CLI-login prompt, so there's no reopen to flicker against.
@@ -1946,13 +1990,15 @@ export function StandaloneChat({
         isMac={isMac}
         isFullscreen={isFullscreen}
         hideInlineHistory={hideInlineHistory}
-        hasRightActions={inspectorHasContent || sidePanelHasContent}
+        hasRightActions={
+          inspectorHasContent || inspectorOpen || sidePanelHasContent
+        }
         showHistory={showHistory}
         settings={settings}
         reloadStore={reloadStore}
         setShowHistory={setShowHistory}
         renameConversation={renameConversation}
-        deleteConversation={deleteConversation}
+        archiveConversation={archiveConversation}
         startNewConversation={startNewConversation}
         onNewChat={async () => {
           piStoppedIntentionallyRef.current = true;
@@ -1990,17 +2036,15 @@ export function StandaloneChat({
 
       <div className="flex-1 flex min-h-0" data-browser-panel-host>
       <div className="relative flex-1 flex flex-col min-w-0" data-firstrun-target="messages">
-      {inspectorHasContent ? (
-        <div className="absolute -top-8 right-2 z-30">
-          <ChatInspectorPopover
-            open={inspectorOpen}
-            onOpenChange={setInspectorOpen}
-            outputs={inspectorOutputs}
-            sources={inspectorSources}
-            onOpenFile={openFilePreview}
-          />
-        </div>
-      ) : null}
+      <div className="absolute -top-8 right-2 z-30">
+        <ChatInspectorPopover
+          open={inspectorOpen}
+          onOpenChange={setInspectorOpen}
+          outputs={inspectorOutputs}
+          sources={inspectorSources}
+          onOpenFile={openFilePreview}
+        />
+      </div>
       <ChatMainPane
         firstRunLearningEnabled={firstRunLearningEnabled}
         firstRunAiPreset={firstRunAiPreset}
@@ -2041,10 +2085,11 @@ export function StandaloneChat({
           await commands.showWindow({ Home: { page: "pipes" } });
         }}
         summaryCardsProps={{
+          onPreviewPrompt: setHomeCardPromptPreview,
           onSendMessage: (message, displayLabel, entrySource, entryCard) => {
             pendingContextualHomeSuggestionRef.current = null;
-            // Control cards send their prompt on click without ever showing it,
-            // so the user authored nothing.
+            // Control cards may preview their prompt as placeholder text, but
+            // never place it in the editable value, so the user authored nothing.
             return sendMessage(message, displayLabel, undefined, {
               entrySource,
               entryCard,
@@ -2130,6 +2175,7 @@ export function StandaloneChat({
           inputRef,
           value: input,
           disabledReason: composerDisabledReason,
+          placeholder: homeCardPromptPreview ?? undefined,
           canChat: Boolean(canSendChatMessage),
           isLoading,
           isStreaming,
@@ -2249,7 +2295,7 @@ export function StandaloneChat({
         error={acpSignInError}
         defaultPresetLabel={acpDefaultPresetLabel}
         onSwitchToDefault={handleAcpSwitchToDefault}
-        onRetry={handleAcpRetry}
+        onCliSignIn={handleAcpCliSignIn}
         onSelectMethod={handleAcpSignInMethod}
         onDismiss={handleAcpDismiss}
       />

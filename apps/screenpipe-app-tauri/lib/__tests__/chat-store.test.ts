@@ -17,14 +17,20 @@ import {
   isReusableBlankChatSession,
   dedupeSessionRecords,
   sessionRecordFromMeta,
+  selectDisplayedChatId,
   applyChatSessionActivity,
+  ensureBlankChatSession,
   type SessionRecord,
   type ChatSessionActivityPayload,
 } from "../stores/chat-store";
 import { conversationDedupIdentity } from "../chat-dedup";
 
 function reset() {
-  useChatStore.setState({ sessions: {}, currentId: null, panelSessionId: null });
+  useChatStore.setState({
+    sessions: {},
+    currentId: null,
+    panelSessionId: null,
+  });
 }
 
 function baseRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
@@ -215,9 +221,62 @@ describe("chat-store: getOrCreateEmptyChatId (no spam on +new)", () => {
     expect(id).toMatch(/-/); // looks like a uuid
   });
 
+  it("seeds the panel's initial id as one reusable hidden draft", () => {
+    const store = useChatStore.getState();
+
+    const first = ensureBlankChatSession(store, "initial-panel", 2_000);
+    const second = ensureBlankChatSession(
+      useChatStore.getState(),
+      "initial-panel",
+      3_000,
+    );
+    useChatStore.getState().actions.setPanelSession("initial-panel");
+
+    expect(second).toBe(first);
+    expect(useChatStore.getState().sessions["initial-panel"]).toMatchObject({
+      draft: true,
+      messages: [],
+      messageCount: 0,
+      createdAt: 2_000,
+      updatedAt: 2_000,
+    });
+    expect(getOrCreateEmptyChatId()).toEqual({
+      id: "initial-panel",
+      isNew: false,
+    });
+  });
+
+  it("never overwrites a canonical session restored before panel seeding", () => {
+    const restored = baseRecord({
+      id: "initial-panel",
+      title: "restored chat",
+      messageCount: 4,
+      messages: undefined,
+      draft: false,
+    });
+    useChatStore.getState().actions.upsert(restored);
+
+    const result = ensureBlankChatSession(
+      useChatStore.getState(),
+      "initial-panel",
+      3_000,
+    );
+
+    expect(result).toBe(useChatStore.getState().sessions["initial-panel"]);
+    expect(result).toMatchObject({
+      title: "restored chat",
+      messageCount: 4,
+      draft: false,
+      messages: undefined,
+      createdAt: 1_000,
+    });
+  });
+
   it("reuses the panel's current chat if it has no user message", () => {
     useChatStore.setState({
-      sessions: { panelChat: baseRecord({ id: "panelChat", messages: [] }) },
+      sessions: {
+        panelChat: baseRecord({ id: "panelChat", messages: [], draft: true }),
+      },
       currentId: null,
       panelSessionId: "panelChat",
     });
@@ -271,8 +330,8 @@ describe("chat-store: getOrCreateEmptyChatId (no spam on +new)", () => {
           createdAt: 100,
           messages: [{ id: "u", role: "user", content: "x", timestamp: 1 }],
         }),
-        oldEmpty: baseRecord({ id: "oldEmpty", createdAt: 200, messages: [] }),
-        newEmpty: baseRecord({ id: "newEmpty", createdAt: 300, messages: [] }),
+        oldEmpty: baseRecord({ id: "oldEmpty", createdAt: 200, messages: [], draft: true }),
+        newEmpty: baseRecord({ id: "newEmpty", createdAt: 300, messages: [], draft: true }),
       },
       currentId: null,
       panelSessionId: "full",
@@ -301,6 +360,27 @@ describe("chat-store: getOrCreateEmptyChatId (no spam on +new)", () => {
     const { id, isNew } = getOrCreateEmptyChatId();
     expect(isNew).toBe(true);
     expect(id).not.toBe("diskChat");
+  });
+
+  it("does NOT reuse a persisted zero-message row that is not an active draft", () => {
+    useChatStore.setState({
+      sessions: {
+        abandoned: baseRecord({
+          id: "abandoned",
+          kind: "chat",
+          messageCount: 0,
+          messages: [],
+          draft: false,
+        }),
+      },
+      currentId: null,
+      panelSessionId: null,
+    });
+
+    const { id, isNew } = getOrCreateEmptyChatId();
+
+    expect(isNew).toBe(true);
+    expect(id).not.toBe("abandoned");
   });
 
   it("does NOT reuse pipe-run / pipe-watch sessions (#4719 regression)", () => {
@@ -345,18 +425,29 @@ describe("chat-store: getOrCreateEmptyChatId (no spam on +new)", () => {
   });
 });
 
-describe("chat-store: setCurrent clears unread atomically", () => {
+describe("chat-store: visible selection follows the rendered panel", () => {
   beforeEach(reset);
 
-  it("flips currentId AND clears unread on the new current in one set", () => {
+  it("clears unread immediately without claiming the panel switched", () => {
     useChatStore.getState().actions.upsert(baseRecord({ id: "A", lastContentAt: 100 }));
     useChatStore.getState().actions.setCurrent("A");
     const state = useChatStore.getState();
     expect(state.currentId).toBe("A");
-    expect(state.panelSessionId).toBe("A");
+    expect(state.panelSessionId).toBeNull();
     expect(state.sessions.A.unread).toBe(false);
     expect(typeof state.sessions.A.lastViewedAt).toBe("number");
     expect(state.sessions.A.lastViewedAt).toBeGreaterThanOrEqual(100);
+  });
+
+  it("keeps the rendered panel selected until its React commit lands", () => {
+    useChatStore.setState({ currentId: "incoming", panelSessionId: "outgoing" });
+    expect(selectDisplayedChatId(useChatStore.getState())).toBe("outgoing");
+
+    useChatStore.getState().actions.setPanelSession("incoming");
+    expect(selectDisplayedChatId(useChatStore.getState())).toBe("incoming");
+
+    useChatStore.setState({ currentId: null });
+    expect(selectDisplayedChatId(useChatStore.getState())).toBeNull();
   });
 });
 
@@ -578,6 +669,39 @@ describe("chat-store: unread is computed from timestamps", () => {
     const session = useChatStore.getState().sessions.A;
     expect(session.lastViewedAt).toBe(0);
     expect(session.unread).toBe(true);
+  });
+});
+
+describe("chat-store: persisted empty chat cleanup", () => {
+  it("hydrates a zero-message chat as a hidden draft, not a Recents row", () => {
+    const record = sessionRecordFromMeta({
+      id: "abandoned-empty-chat",
+      title: "untitled",
+      createdAt: 100,
+      updatedAt: 200,
+      messageCount: 0,
+      pinned: false,
+      hidden: false,
+      kind: "chat",
+    });
+
+    expect(record.draft).toBe(true);
+    expect(isReusableBlankChatSession(record)).toBe(false);
+  });
+
+  it("does not hide an empty scheduled run as a chat draft", () => {
+    const record = sessionRecordFromMeta({
+      id: "pipe-run-1",
+      title: "daily sync",
+      createdAt: 100,
+      updatedAt: 200,
+      messageCount: 0,
+      pinned: false,
+      hidden: false,
+      kind: "pipe-run",
+    });
+
+    expect(record.draft).toBeUndefined();
   });
 });
 
@@ -832,30 +956,41 @@ describe("chat-store: cross-window duplicate row collapsing", () => {
 
 /**
  * applyChatSessionActivity — characterization tests for the `chat-session-activity`
- * merge logic extracted from app/home/page.tsx. These lock in the exact
- * upsert-vs-patch, staleness, title/preview/status merge, lastError, and
- * unread-hint behavior so the useEffect→useTauriEvent refactor (#4791) is
- * provably behavior-preserving. `now` is injected for determinism.
+ * merge logic extracted from app/home/page.tsx. These lock in the canonical
+ * session boundary, staleness, title/preview/status merge, lastError, and
+ * unread-hint behavior. `now` is injected for determinism.
  */
 describe("chat-store: applyChatSessionActivity", () => {
   beforeEach(reset);
 
   const NOW = 9_999;
 
-  it("creates a new session with defaults when none exists", () => {
-    applyChatSessionActivity(useChatStore.getState(), { id: "A", updatedAt: 2_000 });
-    const s = useChatStore.getState().sessions["A"];
-    expect(s).toBeDefined();
-    expect(s.title).toBe("untitled");
-    expect(s.preview).toBe("");
-    expect(s.status).toBe("idle");
-    expect(s.createdAt).toBe(2_000);
-    expect(s.updatedAt).toBe(2_000);
-    expect(s.messageCount).toBe(0);
-    expect(s.pinned).toBe(false);
-  });
+  it.each([
+    { status: "idle" as const },
+    {
+      status: "streaming" as const,
+      preview: "assistant delta",
+      unreadHint: true,
+    },
+    { status: "error" as const, lastError: "provider failed" },
+    { status: "idle" as const, title: "generated title" },
+  ])(
+    "does not materialize an unknown session from activity alone: %j",
+    (activity) => {
+      applyChatSessionActivity(useChatStore.getState(), {
+        id: "A",
+        updatedAt: 2_000,
+        ...activity,
+      });
 
-  it("carries title/preview/status through on create and trims the title", () => {
+      expect(useChatStore.getState().sessions["A"]).toBeUndefined();
+    },
+  );
+
+  it("carries title/preview/status through for an existing canonical session", () => {
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "A", updatedAt: 1_000 }),
+    );
     applyChatSessionActivity(useChatStore.getState(), {
       id: "A",
       title: "  hello  ",
@@ -867,6 +1002,32 @@ describe("chat-store: applyChatSessionActivity", () => {
     expect(s.title).toBe("hello");
     expect(s.preview).toBe("hi there");
     expect(s.status).toBe("streaming");
+  });
+
+  it("patches later activity after canonical content materializes the session", () => {
+    applyChatSessionActivity(useChatStore.getState(), {
+      id: "A",
+      status: "thinking",
+      updatedAt: 1_500,
+    });
+    expect(useChatStore.getState().sessions["A"]).toBeUndefined();
+
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "A", title: "Day Recap", updatedAt: 2_000 }),
+    );
+    applyChatSessionActivity(useChatStore.getState(), {
+      id: "A",
+      status: "streaming",
+      preview: "today's progress",
+      updatedAt: 2_500,
+    });
+
+    expect(useChatStore.getState().sessions["A"]).toMatchObject({
+      title: "Day Recap",
+      status: "streaming",
+      preview: "today's progress",
+      updatedAt: 2_500,
+    });
   });
 
   it("ignores undefined payloads and those missing id or updatedAt", () => {

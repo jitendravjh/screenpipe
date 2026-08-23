@@ -28,7 +28,7 @@ import {
   getCachedBrowserStateEntry,
   resolveNewestBrowserState,
 } from "@/lib/browser-state-cache";
-import { type AIPreset } from "@/lib/utils/tauri";
+import { commands, type AIPreset } from "@/lib/utils/tauri";
 import {
   saveConversationFile,
   loadConversationFile,
@@ -890,6 +890,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           id: m.id,
           role: m.role,
           content,
+          ...(m.importedFrom ? { importedFrom: m.importedFrom } : {}),
           ...(m.intent ? { intent: m.intent } : {}),
           ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
           timestamp: m.timestamp,
@@ -916,6 +917,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       // Same for the branch marker: dropping it on the first typed reply would
       // let the sidebar dedup collapse the fork back into its parent.
       ...(existing?.branchedFrom ? { branchedFrom: existing.branchedFrom } : {}),
+      ...(existing?.importedFrom ? { importedFrom: existing.importedFrom } : {}),
       ...(browserState ? { browserState } : {}),
       ...(existing?.pinned ? { pinned: existing.pinned } : {}),
       ...(existing?.hidden ? { hidden: existing.hidden } : {}),
@@ -1330,7 +1332,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         useAcpSessionConfig.getState().seedSessionId(conv.id, priorAcpSessionId);
       }
       if (persisted) {
-        if (!store.sessions[conv.id]) {
+        // Disk I/O yields to the event router. Re-read before reconciling so a
+        // session created or advanced while the file was loading keeps its
+        // router-owned activity fields (status, counts, and freshness).
+        const sessionAfterLoad = useChatStore.getState().sessions[conv.id];
+        if (!sessionAfterLoad) {
           store.actions.upsert({
             id: conv.id,
             title: persisted.title || "untitled",
@@ -1353,11 +1359,14 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           });
         } else {
           store.actions.patch(conv.id, {
-            title: persisted.title || existing?.title || "untitled",
+            title: persisted.title || sessionAfterLoad.title || "untitled",
             ...(persisted.titleSource ? { titleSource: persisted.titleSource } : {}),
             pinned: persisted.pinned === true,
             hidden: persisted.hidden === true,
-            updatedAt: Math.max(existing?.updatedAt ?? 0, persisted.updatedAt ?? 0),
+            updatedAt: Math.max(
+              sessionAfterLoad.updatedAt,
+              persisted.updatedAt ?? 0,
+            ),
             ...(persisted.kind ? { kind: persisted.kind } : {}),
             ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
             ...(persisted.sidebarGroup ? { sidebarGroup: persisted.sidebarGroup } : {}),
@@ -1368,16 +1377,30 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         }
       }
     }
-    let messagesForPanel: any[];
-    if (existing?.messages && existing.messages.length > 0) {
-      messagesForPanel = existing.messages as any[];
+    // Re-read after the disk await so a router or sibling-window update that
+    // advanced this session during I/O participates in transcript selection.
+    const currentSession = useChatStore.getState().sessions[conv.id];
+    const persistedMessages = persisted
+      ? toRuntimeMessages(persisted.messages as Message[])
+      : [];
+    let messagesForPanel: Message[];
+    if (currentSession?.messages && currentSession.messages.length > 0) {
+      const currentMessages = currentSession.messages as Message[];
+      const adoptPersisted = shouldAdoptPersistedTranscript(
+        currentMessages,
+        persistedMessages,
+      );
+      messagesForPanel = adoptPersisted ? persistedMessages : currentMessages;
+      if (adoptPersisted) {
+        store.actions.setMessages(conv.id, messagesForPanel);
+      }
       // Restore in-flight streaming markers so the panel resumes
       // exactly where the user left it. The router has been keeping
       // these up-to-date for any tokens that arrived while the user
       // was elsewhere.
-      piStreamingTextRef.current = existing.streamingText ?? "";
-      piMessageIdRef.current = existing.streamingMessageId ?? null;
-      piContentBlocksRef.current = (existing.contentBlocks as any[]) ?? [];
+      piStreamingTextRef.current = currentSession.streamingText ?? "";
+      piMessageIdRef.current = currentSession.streamingMessageId ?? null;
+      piContentBlocksRef.current = (currentSession.contentBlocks as any[]) ?? [];
       // Self-heal a stuck `isStreaming` flag. The router bumps
       // `updatedAt` on every token via patchMessage, so silence past
       // STALE_MS means the stream is dead (Pi process died without
@@ -1386,15 +1409,16 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       // the typing-cursor / loading dots forever.
       const STALE_MS = 30_000;
       const isStale =
-        !!existing.isStreaming && Date.now() - existing.updatedAt > STALE_MS;
+        !!currentSession.isStreaming &&
+        Date.now() - currentSession.updatedAt > STALE_MS;
       if (isStale) {
         store.actions.endTurn(conv.id);
         piStreamingTextRef.current = "";
         piMessageIdRef.current = null;
         piContentBlocksRef.current = [];
       } else {
-        if (existing.isLoading) setIsLoading(true);
-        if (existing.isStreaming) setIsStreaming(true);
+        if (currentSession.isLoading) setIsLoading(true);
+        if (currentSession.isStreaming) setIsStreaming(true);
       }
       store.actions.markHydrated(conv.id);
     } else {
@@ -1412,6 +1436,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         id: m.id,
         role: m.role,
         content: m.content,
+        ...(m.importedFrom ? { importedFrom: m.importedFrom } : {}),
         ...((m as any).intent ? { intent: (m as any).intent } : {}),
         ...((m as any).turnIntentId ? { turnIntentId: (m as any).turnIntentId } : {}),
         timestamp: m.timestamp,
@@ -1433,7 +1458,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         ...((m as any).stoppedByUser ? { stoppedByUser: true } : {}),
       }));
       // Make sure a record exists, then seed messages and mark hydrated.
-      if (!store.sessions[conv.id]) {
+      const sessionBeforeSeed = useChatStore.getState().sessions[conv.id];
+      if (!sessionBeforeSeed) {
         store.actions.upsert({
           id: conv.id,
           title: full.title || "untitled",
@@ -1459,11 +1485,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         });
       } else if (conv.kind || conv.pipeContext || conv.sidebarGroup || full.sidebarGroup) {
         store.actions.patch(conv.id, {
-          title: full.title || store.sessions[conv.id]?.title || "untitled",
+          title: full.title || sessionBeforeSeed.title || "untitled",
           ...(full.titleSource ? { titleSource: full.titleSource } : {}),
           pinned: full.pinned === true,
           hidden: full.hidden === true,
-          updatedAt: Math.max(store.sessions[conv.id]?.updatedAt ?? 0, full.updatedAt ?? 0),
+          updatedAt: Math.max(sessionBeforeSeed.updatedAt, full.updatedAt ?? 0),
           ...(conv.kind ? { kind: conv.kind } : {}),
           ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : {}),
           ...(conv.sidebarGroup ? { sidebarGroup: conv.sidebarGroup } : full.sidebarGroup ? { sidebarGroup: full.sidebarGroup } : {}),
@@ -1758,7 +1784,30 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // Reuse an existing empty chat when the caller didn't pin an id (#4719),
     // so a header "+ new chat" (or an agent-evicted / post-delete restart)
     // doesn't mint a throwaway uuid when a blank chat is already available.
-    const newSid = explicitId ?? getOrCreateEmptyChatId().id;
+    const nextSession = explicitId
+      ? { id: explicitId, isNew: !store.sessions[explicitId] }
+      : getOrCreateEmptyChatId();
+    const newSid = nextSession.id;
+    // The Home-level new-chat shortcut already creates this draft record,
+    // but the inline chat header (including last-tab recovery) calls this hook
+    // directly. Without an immediate record, currentId can point at an id
+    // that selectors cannot resolve until the first message is sent.
+    if (nextSession.isNew) {
+      const now = Date.now();
+      store.actions.upsert({
+        id: newSid,
+        title: "untitled",
+        preview: "",
+        status: "idle",
+        messageCount: 0,
+        createdAt: now,
+        updatedAt: now,
+        pinned: false,
+        unread: false,
+        draft: true,
+        messages: [],
+      });
+    }
     piSessionIdRef.current = newSid;
     piSessionSyncedRef.current = true;
     store.actions.setCurrent(newSid);
@@ -1771,6 +1820,31 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // ("analyzing…" stuck). Setting conversationId here keeps the
     // foreground key in sync with piSessionIdRef from message 0.
     setConversationId(newSid);
+  };
+
+  // ---- archiveConversation ----
+  // The chat-title menu uses Archive as its safe primary history action.
+  // Permanent deletion remains available from the sidebar row menu, where
+  // the conversation being acted on is explicit and a confirmation follows.
+  const archiveConversation = async (convId: string) => {
+    await updateConversationFlags(convId, { hidden: true });
+    commands.piAbort(convId).catch(() => {});
+
+    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const store = useChatStore.getState();
+    store.actions.patch(convId, { hidden: true, unread: false });
+    await refreshFileConversations();
+
+    try {
+      await emit("chat-visibility-changed", { id: convId, hidden: true });
+    } catch {
+      // The local store and file are already updated; another window can
+      // repair itself on its next disk hydration.
+    }
+
+    if (conversationId === convId || piSessionIdRef.current === convId) {
+      await startNewConversation();
+    }
   };
 
   // ---- filteredConversations ----
@@ -1820,6 +1894,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     saveConversation,
     loadConversation,
     deleteConversation,
+    archiveConversation,
     renameConversation,
     startNewConversation,
     branchConversation,

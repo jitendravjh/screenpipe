@@ -336,13 +336,14 @@
         "agent-permissions",
         "agent-cancellation",
         "agent-terminal",
+        "agent-tool-metadata",
         "mcp-registration",
         "process-supervision"
       ],
       "criticality": "high",
       "confidence": "partial",
       "ux": "mixed",
-      "notes": "Official Rust ACP SDK runtime and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, exact adapter/descendant reaping, terminal lifecycle/output draining, and a real authenticated local API MCP health call. Curated third-party adapters remain manual smoke coverage."
+      "notes": "Official Rust ACP SDK runtime and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, exact adapter/descendant reaping, terminal lifecycle/output draining, late tool metadata/error propagation with a provider fallback, and a real authenticated local API MCP health call. Curated third-party adapters remain manual smoke coverage."
     },
     {
       "spec": "acp-onboarding-ux.spec.ts",
@@ -671,12 +672,14 @@
       ],
       "features": [
         "chat",
-        "chat-sidebar-dedupe"
+        "chat-home-card-placeholder-preview",
+        "chat-sidebar-dedupe",
+        "chat-session-activity"
       ],
       "criticality": "medium",
       "confidence": "partial",
       "ux": "real-user-flow",
-      "notes": "Home automation card clicks must create exactly one persisted conversation per card, guarding the #4719 duplicate-row path."
+      "notes": "The Day Recap automation card previews its user-facing prompt in the empty composer on hover, restores the default placeholder on leave, and creates exactly one persisted conversation and one sidebar row; status-only activity for an unknown session must not create an empty untitled sibling."
     },
     {
       "spec": "chat-composer-isolation.spec.ts",
@@ -844,13 +847,14 @@
       ],
       "features": [
         "chat",
+        "chat-background-readiness",
         "chat-first-message-ux",
         "chat-turn-status"
       ],
       "criticality": "medium",
       "confidence": "partial",
       "ux": "real-user-flow",
-      "notes": "Real + new chat through the first assistant token over a cold Pi start: pins that the message and cleared composer land in the send frame, that only one status element is ever mounted, and that the pane never snaps alignment. Opt-in (SCREENPIPE_E2E_LOCAL_AI_GATEWAY)."
+      "notes": "Real + new chat through the first assistant token over a cold Pi start: holds the runtime-readiness gate while typing and submitting, pins that the early send waits with its message visible, that the message and cleared composer land in the send frame, that only one status element is ever mounted, and that the pane never snaps alignment. Opt-in (SCREENPIPE_E2E_LOCAL_AI_GATEWAY)."
     },
     {
       "spec": "chat-new-session-stale-save.spec.ts",
@@ -965,7 +969,7 @@
       "criticality": "medium",
       "confidence": "partial",
       "ux": "synthetic",
-      "notes": "QUARANTINED (#4610): cross-window prefill duplicate regression. The autoSend persist precondition is racy in CI — times out with 0 conversations (not the duplicate=2 it guards) ~100% Linux + ~33% macOS. Re-enable once it seeds the persisted conversation deterministically."
+      "notes": "QUARANTINED (#4610): cross-window prefill duplicate regression. The autoSend persist precondition is racy in CI \u2014 times out with 0 conversations (not the duplicate=2 it guards) ~100% Linux + ~33% macOS. Re-enable once it seeds the persisted conversation deterministically."
     },
     {
       "spec": "chat-queue-burst-pending.spec.ts",
@@ -1045,7 +1049,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "mixed",
-      "notes": "A collapsed Pipes section loads nothing; expanding it lists a compact execution-backed activity page, expanding a pipe lazily loads its newest 10 executions, and older runs paginate on demand."
+      "notes": "The long chat inventory scrolls independently; a collapsed Pipes section loads nothing, expanding it lists a compact execution-backed activity page, expanding a pipe lazily loads its newest 10 executions, and older runs paginate on demand."
     },
     {
       "spec": "chat-sidebar-repeated-prompt.spec.ts",
@@ -1155,7 +1159,7 @@
       "criticality": "high",
       "confidence": "partial",
       "ux": "synthetic",
-      "notes": "A turn that ends while the panel does not own the session on the agent-event bus must still release the composer dispatch guards and must not duplicate the user message; regression for the stuck 'analyzing…' chat whose later messages all piled into QUEUED."
+      "notes": "A turn that ends while the panel does not own the session on the agent-event bus must still release the composer dispatch guards and must not duplicate the user message; regression for the stuck 'analyzing\u2026' chat whose later messages all piled into QUEUED."
     },
     {
       "spec": "chat-subagent-async-completion.spec.ts",
@@ -1199,6 +1203,27 @@
       "notes": "Switching conversations during streaming must not corrupt state."
     },
     {
+      "spec": "chat-sidebar-navigation.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "chat-navigation",
+        "chat-sidebar"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Native Home WebView coverage for one active conversation, atomic sidebar-to-panel navigation, clean new-chat drafts, semantic unread state, removal of the duplicate tab strip, and a title-scoped Pin/Rename/Archive menu."
+    },
+    {
       "spec": "chat-tool-activity.spec.ts",
       "platforms": [
         "windows",
@@ -1212,14 +1237,14 @@
       "features": [
         "chat",
         "chat-tools",
-        "mcp-startup-status",
+        "mcp-startup-filtering",
         "pi-tool-activity",
         "progressive-disclosure"
       ],
       "criticality": "high",
       "confidence": "strong",
       "ux": "mixed",
-      "notes": "Mixed Python, JavaScript, Screenpipe API, file, test, recovered-error, and optional live Pi tool flows stay collapsed by default, expose only friendly activity on first expansion, and keep completed tools active while the shared Pi turn is still streaming. Synthetic MCP startup events render as a separate connection card with captured connecting, connected, sign-in-required, generic-error, and mixed-state screenshots; they never inflate the command rail's failure count."
+      "notes": "Mixed Python, JavaScript, Screenpipe API, file, test, recovered-error, and optional live Pi tool flows stay collapsed by default, expose only friendly activity on first expansion, and keep completed tools active while the shared Pi turn is still streaming. Synthetic MCP startup events stay out of the transcript so the answer remains primary, connection diagnostics never leak into chat, and startup failures never inflate the command rail's failure count."
     },
     {
       "spec": "chat-window.spec.ts",
@@ -1359,13 +1384,14 @@
       ],
       "features": [
         "onboarding",
-        "first-run-learning"
+        "first-run-learning",
+        "shortcuts"
       ],
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
       "tests": 8,
-      "notes": "Post-setup summary on Home under the authenticated seed: immediate runs show a live countdown, empty engine results settle silently with their diagnostic reason preserved, silent states stay silent across reloads, late returns retry in the background, ready summaries remain actionable, and idle/done never render."
+      "notes": "Post-setup summary on Home under the authenticated seed: immediate runs show a live countdown, empty engine results settle silently with their diagnostic reason preserved, silent states stay silent across reloads, late returns retry in the background, ready summaries remain actionable, a verified shown Chat-shortcut outcome completes the contextual practice lesson while a hidden outcome stays recoverable, and idle/done never render."
     },
     {
       "spec": "first-run-reset-learning-window.spec.ts",
@@ -1451,6 +1477,27 @@
       "notes": "Help section Discord invite link."
     },
     {
+      "spec": "history-swipe-navigation.spec.ts",
+      "platforms": [
+        "windows",
+        "macos"
+      ],
+      "layers": [
+        "real-ui-e2e",
+        "window-lifecycle",
+        "tauri-command"
+      ],
+      "features": [
+        "home-navigation",
+        "window-lifecycle"
+      ],
+      "criticality": "medium",
+      "confidence": "partial",
+      "ux": "real-user-flow",
+      "tests": 2,
+      "notes": "Reads back the real WKWebView/WebView2 history-swipe setting, verifies top-level UI sections are browser-history entries, proves Back to app consumes Settings so the next back action restores the prior Home state, and captures every destination plus the production back/forward gesture-arrow design. Physical OS trackpad input remains manual."
+    },
+    {
       "spec": "home-window.spec.ts",
       "platforms": [
         "windows",
@@ -1528,12 +1575,13 @@
       ],
       "features": [
         "brain-overview",
-        "live-view-canvas-pinch-zoom"
+        "live-view-canvas-pinch-zoom",
+        "live-view-canvas-click-stability"
       ],
       "criticality": "medium",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Drives the Live View canvas with the same native-magnify payload the macOS magnification gesture recognizer emits. Asserts the recognizer takes ownership so WebKit's duplicate ctrl+wheel stops zooming while plain scroll still pans, that an app-wide pinch is ignored by an unfocused canvas, and that canvas zoom stays anchored, clamped at 25%, and persisted through load_brain_view_canvas. The focused per-frame zoom arithmetic is asserted in the component tests because WKWebView under WebDriver does not reliably receive OS-level focus."
+      "notes": "Drives the Live View canvas with the same window-scoped native-magnify payload the macOS magnification gesture recognizer emits. Asserts pinch works even when WKWebView lacks DOM focus, the recognizer takes ownership so WebKit's duplicate ctrl+wheel stops zooming while plain scroll still pans, ordinary pane, Block, and double clicks do not change the viewport, and canvas zoom stays anchored, clamped at 25%, and persisted through load_brain_view_canvas."
     },
     {
       "spec": "macos-ui-performance.spec.ts",
@@ -1752,6 +1800,23 @@
       "notes": "Seeds a meeting with notes and summary, switches persistent tabs, resizes to 640x560, checks footer separation and horizontal overflow, then captures a review screenshot."
     },
     {
+      "spec": "meeting-chat-panel.spec.ts",
+      "platforms": [
+        "macos"
+      ],
+      "layers": [
+        "real-ui-e2e",
+        "local-api"
+      ],
+      "features": [
+        "meeting-notes"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Seeds a settled meeting and walks the chat rail disclosure ladder in the real app: rest shows one line plus one chip and no send button, focus peeks open with suggestions, typing hides the chip and reveals send, Escape collapses while keeping the draft, status precedence names why the composer is disabled, and a 720x620 window produces no horizontal overflow. Captures a screenshot per state."
+    },
+    {
       "spec": "meetings-only-audio-lifecycle.spec.ts",
       "platforms": [
         "windows",
@@ -1953,14 +2018,14 @@
         "settings"
       ],
       "features": [
+        "ai-tools",
         "connections",
-        "pi-extensions",
-        "agent-extensions"
+        "pi-extensions"
       ],
       "criticality": "medium",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Opens Home -> Connections, opens Agent extensions, verifies provider-neutral built-ins and compatibility labels, filters the Pi package search, and captures a screenshot. Read-only smoke: does not install packages."
+      "notes": "Opens Home -> Connections, opens the first AI tools setting, verifies the common tool toggles are first and directly visible in the modal, checks plain-language built-ins and compatibility labels, filters the package search, and captures a screenshot. Read-only smoke: does not install packages."
     },
     {
       "spec": "pipe-continuous-chat.spec.ts",

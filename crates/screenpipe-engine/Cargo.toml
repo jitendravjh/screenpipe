@@ -16,13 +16,14 @@ edition = { workspace = true }
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 libc = { workspace = true }
 oasgen = { workspace = true }
 
 screenpipe-events = { path = "../screenpipe-events" }
 screenpipe-screen = { path = "../screenpipe-screen" }
 screenpipe-audio = { path = "../screenpipe-audio" }
-screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
+screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets", "acp"] }
 screenpipe-db = { path = "../screenpipe-db" }
 screenpipe-redact = { path = "../screenpipe-redact", features = ["opf-text"] }
 screenpipe-resource = { path = "../screenpipe-resource" }

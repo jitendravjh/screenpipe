@@ -20,6 +20,17 @@ import {
   setCachedBrowserState,
 } from "../browser-state-cache";
 
+const routerCommandMocks = vi.hoisted(() => ({
+  piStopIfIdle: vi.fn(async () => ({
+    status: "ok" as const,
+    data: { running: false, busy: false },
+  })),
+}));
+
+vi.mock("@/lib/utils/tauri", () => ({
+  commands: { piStopIfIdle: routerCommandMocks.piStopIfIdle },
+}));
+
 vi.mock("@/lib/chat-storage", () => ({
   listConversations: vi.fn(async () => []),
   loadConversationFile: vi.fn(async () => null),
@@ -172,12 +183,17 @@ describe("pi-event-router: status mirroring for backgrounded sessions", () => {
     useChatStore.setState({ currentId: "B" });
     await handlePiEvent(piEvt("A", { type: "agent_end" }));
     expect(useChatStore.getState().sessions.A.status).toBe("idle");
+    await vi.waitFor(() => {
+      expect(routerCommandMocks.piStopIfIdle).toHaveBeenCalledWith("A");
+    });
   });
 
   it("stays streaming while agent_end is followed by an automatic retry", async () => {
     seed("A", { status: "streaming" });
     useChatStore.setState({ currentId: "B" });
     await handlePiEvent(piEvt("A", { type: "agent_end", willRetry: true }));
+    await Promise.resolve();
+    expect(routerCommandMocks.piStopIfIdle).not.toHaveBeenCalled();
     expect(useChatStore.getState().sessions.A.status).toBe("streaming");
 
     await handlePiEvent(piEvt("A", {
@@ -936,6 +952,48 @@ describe("pi-event-router: subagent tool progress", () => {
       (b) => b.type === "tool" && b.toolCall.id === "cmd-1",
     ).toolCall;
     expect(cmd.progress.length).toBe(4000);
+  });
+
+  it("keeps late ACP metadata on a completed background tool", async () => {
+    seed("A");
+    useChatStore.setState({ currentId: "B" });
+    await handlePiEvent(
+      piEvt("A", { type: "message_start", message: { role: "assistant" } }),
+    );
+    await handlePiEvent(
+      piEvt("A", {
+        type: "tool_execution_start",
+        toolCallId: "late-metadata",
+        toolName: "MCP: tool",
+        agentId: "cursor",
+        args: {},
+      } as unknown as AgentInnerEvent),
+    );
+    await handlePiEvent(
+      piEvt("A", {
+        type: "tool_execution_end",
+        toolCallId: "late-metadata",
+        toolName: "mcp__screenpipe__search-content",
+        agentId: "cursor",
+        kind: "search",
+        args: { query: "late ACP metadata" },
+        result: { content: [{ type: "text", text: '{"error":"Tool execution error"}' }] },
+        isError: true,
+      } as unknown as AgentInnerEvent),
+    );
+
+    const session = useChatStore.getState().sessions.A;
+    const tool = (session.contentBlocks as any[]).find(
+      (block) => block.type === "tool" && block.toolCall.id === "late-metadata",
+    ).toolCall;
+    expect(tool).toMatchObject({
+      toolName: "mcp__screenpipe__search-content",
+      agentId: "cursor",
+      kind: "search",
+      args: { query: "late ACP metadata" },
+      isRunning: false,
+      isError: true,
+    });
   });
 });
 

@@ -39,8 +39,7 @@ use tracing_oslog::OsLogger;
 use updates::start_update_check;
 use window::ShowRewindWindow;
 
-mod acp_extensions;
-mod acp_runtime;
+mod activity_history;
 mod analytics;
 mod auth_session;
 #[allow(deprecated)]
@@ -52,6 +51,7 @@ mod auth_token;
 mod brain_views;
 mod calendar;
 mod capture_session;
+mod chat_control;
 mod chatgpt_oauth;
 #[allow(deprecated)]
 mod commands;
@@ -79,6 +79,7 @@ mod enterprise_config_file;
 mod enterprise_host_identity;
 mod enterprise_install_metadata;
 mod enterprise_policy;
+mod enterprise_recording_access;
 mod enterprise_sync;
 mod events;
 mod feedback_redact;
@@ -163,6 +164,7 @@ pub use enterprise_install_metadata::get_enterprise_install_metadata;
 pub use enterprise_host_identity::get_enterprise_host_identity;
 pub use enterprise_policy::set_enterprise_policy;
 pub use enterprise_policy::set_sync_streams;
+pub use enterprise_recording_access::set_enterprise_recording_authorized;
 pub use permissions::do_permissions_check;
 pub use permissions::open_permission_settings;
 pub use permissions::request_permission;
@@ -427,49 +429,19 @@ macro_rules! define_specta_builder {
 
 #[tokio::main]
 async fn main() {
-    if acp_extensions::is_portable_mcp_mode() {
-        let exit_code = match acp_extensions::run_portable_mcp_mode() {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                eprintln!("[acp-extension] {error}");
-                1
-            }
-        };
+    // Handle private ACP subprocess modes before Tauri initializes. The
+    // protocol host lives in core; desktop contributes only schedule projection.
+    if let Some(exit_code) = screenpipe_core::agents::acp::run_hidden_mode(Arc::new(
+        provider_automations::ProviderAutomationObserver,
+    ))
+    .await
+    {
         std::process::exit(exit_code);
     }
 
-    if acp_runtime::is_process_guard_mode() {
-        let exit_code = match acp_runtime::run_process_guard() {
-            Ok(exit_code) => exit_code,
-            Err(error) => {
-                eprintln!("[acp-process-guard] {error}");
-                1
-            }
-        };
-        std::process::exit(exit_code);
-    }
-
-    // ACP runs in a hidden mode of this same executable. Keeping the protocol
-    // runtime in Rust avoids shipping a second sidecar while ensuring this path
-    // exits before any Tauri, database, or recording initialization.
-    if acp_runtime::is_runtime_mode() {
-        let exit_code = match acp_runtime::run_from_env().await {
-            Ok(()) => 0,
-            Err(error) => {
-                use std::io::Write as _;
-                let mut stdout = std::io::stdout().lock();
-                let _ = writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::json!({ "type": "acp_fatal", "error": error })
-                );
-                let _ = stdout.flush();
-                eprintln!("[acp-runtime] {error}");
-                1
-            }
-        };
-        std::process::exit(exit_code);
-    }
+    // The packaged updater E2E latches whether the replacement process began
+    // before macOS finished releasing the previous app's SCK/TCC state.
+    process_exit::latch_e2e_sck_relaunch_race();
 
     // Point debug builds at their own data dir and ports so `bun tauri dev`
     // can't hand off to (or kill) an installed production app. Must run before
@@ -605,6 +577,9 @@ async fn main() {
     {
         let args: Vec<String> = std::env::args().collect();
         let deep_link_url = deep_link::url_from_args(&args);
+        let launch_exe = std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string());
 
         let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
             .ok()
@@ -616,6 +591,7 @@ async fn main() {
             .json(&serde_json::json!({
                 "args": args,
                 "deep_link_url": deep_link_url,
+                "launch_exe": launch_exe,
             }))
             .send()
             .await
@@ -1145,6 +1121,7 @@ async fn main() {
     let sync_scheduler = screenpipe_connect::sync_scheduler::SyncScheduler::new();
 
     let app = app.manage(recording_state)
+        .manage(activity_history::ActivityHistoryState::default())
         .manage(disk_pressure_notifications::DiskPressureNotificationState::default())
         .manage(pi_state)
         .manage(suggestions_state)
@@ -1157,10 +1134,20 @@ async fn main() {
             // reason parameter) is still the current Apple event.
             let from_autostart = launched_from_autostart();
 
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(windows)]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 app.deep_link().register_all()?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                // Minimal Linux installs may not provide
+                // `update-desktop-database`. Deep-link registration is useful
+                // integration, but it must not make the recorder fail startup.
+                if let Err(error) = app.deep_link().register_all() {
+                    eprintln!("deep-link registration skipped: {error}");
+                }
             }
             let app_handle = app.handle();
 
@@ -1632,12 +1619,11 @@ async fn main() {
 
             let app_ui_hidden = crate::enterprise_policy::is_app_ui_hidden();
 
-            // The old connection slide blocked onboarding on work that can be
-            // done safely and idempotently by Rust. During first-run setup,
-            // wire detected local AI tools in the background; after onboarding
-            // completes this no longer runs, so an explicit Settings removal
-            // remains removed on future launches.
-            if !onboarding_store.is_completed && !app_ui_hidden {
+            // Keep every detected local AI tool connected to screenpipe. The
+            // setup is backgrounded and idempotent: it installs missing MCP +
+            // skill entries, refreshes stale screenpipe launchers, and leaves
+            // unrelated tool settings alone.
+            if !app_ui_hidden {
                 let local_api = recording::local_api_context_from_app(&app.handle());
                 skills::connect_detected_ai_tools_in_background(
                     store.recording.api_auth,
@@ -2250,6 +2236,7 @@ async fn main() {
                 });
             }
             crate::disk_pressure_notifications::start(app_handle.clone());
+            activity_history::start(app_handle.clone());
 
             // Background ChatGPT OAuth token refresh — keeps access tokens
             // fresh so the lazy path in get_valid_token() rarely needs to

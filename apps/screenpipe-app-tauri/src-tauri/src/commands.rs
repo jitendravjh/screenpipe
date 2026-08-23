@@ -61,7 +61,8 @@ fn log_webview_build_failure(label: &str, url_hint: &str, err: &(impl std::fmt::
 mod tests {
     use super::{
         enterprise_license_key_sha256, fallback_local_api_config, is_login_callback_scheme,
-        merge_enterprise_file_configs, persist_enterprise_device_config,
+        merge_enterprise_file_configs, normalize_enterprise_config_value,
+        persist_enterprise_device_config,
         persist_recovered_enterprise_device_config, read_enterprise_config_from_path,
         notification_belongs_to_overlay, recovery_anchor_license_key, save_enterprise_team_config,
         scan_chat_entries_by_mtime, shortcut_overlay_hidden_by_choice,
@@ -304,6 +305,19 @@ mod tests {
         std::fs::write(&path, r#"{"license_key":"  ","ingest_url":""}"#).unwrap();
         let cfg = read_enterprise_config_from_path(&path).unwrap();
         assert!(cfg.is_empty());
+    }
+
+    #[test]
+    fn registry_enterprise_key_ignores_blank_values() {
+        assert_eq!(
+            normalize_enterprise_config_value(Some("  ENT-REGISTRY-KEY  ".to_string())),
+            Some("ENT-REGISTRY-KEY".to_string())
+        );
+        assert_eq!(
+            normalize_enterprise_config_value(Some("   ".to_string())),
+            None
+        );
+        assert_eq!(normalize_enterprise_config_value(None), None);
     }
 
     #[test]
@@ -691,6 +705,13 @@ fn recovery_anchor_license_key<'a>(
     bundled_license_key.unwrap_or(rejected_license_key)
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn normalize_enterprise_config_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Preserve bundled/MDM precedence except for a recovery record tied to the
 /// exact bundled key it replaces. A later MDM key automatically wins because
 /// its fingerprint no longer matches.
@@ -719,10 +740,57 @@ fn merge_enterprise_file_configs(
     bundled
 }
 
+#[cfg(target_os = "windows")]
+fn read_enterprise_config_from_windows_registry() -> Option<EnterpriseFileConfig> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    // Intune runs 64-bit PowerShell by default, but older deployment scripts
+    // may have written through a 32-bit host. Prefer the documented 64-bit view
+    // and fall back to the 32-bit view so upgrades do not strand those fleets.
+    for view in [KEY_WOW64_64KEY, KEY_WOW64_32KEY] {
+        let Ok(key) = hklm.open_subkey_with_flags("SOFTWARE\\screenpipe", KEY_READ | view) else {
+            continue;
+        };
+        let license_key = normalize_enterprise_config_value(
+            key.get_value::<String, _>("EnterpriseLicenseKey").ok(),
+        );
+        if license_key.is_some() {
+            info!(
+                "enterprise: license key loaded from HKLM\\SOFTWARE\\screenpipe ({})",
+                if view == KEY_WOW64_64KEY {
+                    "64-bit view"
+                } else {
+                    "32-bit view"
+                }
+            );
+            return Some(EnterpriseFileConfig {
+                license_key,
+                ..EnterpriseFileConfig::default()
+            });
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_enterprise_config_from_windows_registry() -> Option<EnterpriseFileConfig> {
+    None
+}
+
+/// Read an administrator-deployed config. An executable-adjacent file is the
+/// explicit cross-platform contract and therefore wins as a complete config;
+/// the Windows registry is the documented Intune fallback when no such file is
+/// bundled.
+fn read_enterprise_config_from_deployment() -> Option<EnterpriseFileConfig> {
+    read_enterprise_config_from_exe_dir().or_else(read_enterprise_config_from_windows_registry)
+}
+
 /// Read enterprise device config. Bundled/MDM config is authoritative unless
-/// the user file carries a validated recovery for that exact bundled key.
+/// the user file carries a validated recovery for that exact deployed key.
 pub fn get_enterprise_file_config() -> EnterpriseFileConfig {
-    let bundled = read_enterprise_config_from_exe_dir();
+    let bundled = read_enterprise_config_from_deployment();
     let user_path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
     let user = if user_path.exists() {
         info!(
@@ -734,13 +802,14 @@ pub fn get_enterprise_file_config() -> EnterpriseFileConfig {
         None
     };
     if bundled.is_none() && user.is_none() {
-        info!("enterprise: no enterprise.json found in any location");
+        info!("enterprise: no deployed or user enterprise config found");
     }
     merge_enterprise_file_configs(bundled, user)
 }
 
-/// Read the enterprise license key from `enterprise.json`.
-/// Returns None if no file is found or is invalid.
+/// Read the enterprise license key from deployment config (`enterprise.json`
+/// or the documented Windows registry value) and the user recovery config.
+/// Returns None if no valid key is found.
 #[tauri::command]
 #[specta::specta]
 pub fn get_enterprise_license_key() -> Option<String> {
@@ -896,7 +965,8 @@ pub fn persist_recovered_enterprise_device_config(
     // A user recovery overlays the executable-adjacent file. Keep every
     // subsequent rotation tied to that immutable source key so recovery B can
     // replace recovery A without making the overlay disappear on restart.
-    let bundled_license_key = read_enterprise_config_from_exe_dir().and_then(|cfg| cfg.license_key);
+    let bundled_license_key =
+        read_enterprise_config_from_deployment().and_then(|cfg| cfg.license_key);
     let recovery_anchor =
         recovery_anchor_license_key(bundled_license_key.as_deref(), replaced_license_key);
     persist_enterprise_device_config_inner(Some(license_key), ingest_url, Some(recovery_anchor))
@@ -907,7 +977,7 @@ pub fn persist_recovered_enterprise_device_config(
 #[tauri::command]
 #[specta::specta]
 pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
-    let bundled_key = read_enterprise_config_from_exe_dir().and_then(|cfg| cfg.license_key);
+    let bundled_key = read_enterprise_config_from_deployment().and_then(|cfg| cfg.license_key);
     match bundled_key
         .as_deref()
         .filter(|key| *key != license_key.as_str())
@@ -3709,23 +3779,18 @@ pub async fn show_notification_panel(
     app_handle: tauri::AppHandle,
     payload: String,
 ) -> Result<(), String> {
-    deliver_notification_panel(app_handle, payload, true)
+    deliver_notification_panel(app_handle, payload)
         .await
         .map(|_| ())
 }
 
 /// Render an alert, returning what actually happened to it.
 ///
-/// `apply_repeat_gate` exists because the repeat gate is check-and-record, so
-/// running it twice for one alert makes the second call collide with the
-/// record the first call just wrote. `/notify` already gates before it
-/// persists, so it passes `false` and stays the single recorder for that path;
-/// the direct callers (capture-stall, audio device/health) come straight here
-/// and pass `true`.
+/// This is the single check-and-record owner for repeat suppression. `/notify`
+/// only peeks before persisting, while direct callers come straight here.
 pub(crate) async fn deliver_notification_panel(
     app_handle: tauri::AppHandle,
     payload: String,
-    apply_repeat_gate: bool,
 ) -> Result<NotificationDelivery, String> {
     use tauri::{Emitter, WebviewWindowBuilder};
 
@@ -3760,14 +3825,12 @@ pub(crate) async fn deliver_notification_panel(
         crate::notifications::gate::title_from_payload(&payload).unwrap_or_default();
     let notification_body =
         crate::notifications::gate::body_from_payload(&payload).unwrap_or_default();
-    if apply_repeat_gate
-        && crate::notifications::gate::repeat_suppressed_now(
-            notification_type.as_deref(),
-            notification_pipe.as_deref(),
-            &notification_title,
-            &notification_body,
-        )
-    {
+    if crate::notifications::gate::repeat_suppressed_now(
+        notification_type.as_deref(),
+        notification_pipe.as_deref(),
+        &notification_title,
+        &notification_body,
+    ) {
         info!(
             "show_notification_panel: suppressed (repeat within cooldown, type={:?})",
             notification_type
@@ -4482,16 +4545,12 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
         let obsidian_uri = format!("obsidian://open?path={}", urlencoding::encode(&path));
-        let mut a = Command::new("cmd");
-        a.args(["/C", "start", "", &obsidian_uri]);
-        a.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let mut b = Command::new("cmd");
-        b.args(["/C", "start", "", &path]);
-        b.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        if a.spawn().is_ok() || b.spawn().is_ok() {
+        if open_windows_shell_target(obsidian_uri).is_ok() {
+            return Ok(());
+        }
+
+        if open_windows_shell_target(path.clone()).is_ok() {
             Ok(())
         } else {
             Err(format!("failed to open note path: {}", path))
@@ -4513,23 +4572,43 @@ pub async fn open_note_path(path: String) -> Result<(), String> {
 pub fn open_windows_shell_target(target: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", &target])
-            .creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let target = target.trim().to_string();
+        if target.is_empty() {
+            return Err("failed to open Windows shell target: target is empty".to_string());
+        }
 
-        match cmd.status() {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!(
-                "failed to open Windows shell target {}: {}",
-                target, status
-            )),
-            Err(e) => Err(format!(
-                "failed to open Windows shell target {}: {}",
-                target, e
-            )),
+        let operation = "open"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let target_wide = target
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(operation.as_ptr()),
+                PCWSTR(target_wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+
+        let result_code = result.0 as isize;
+        if result_code > 32 {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to open Windows shell target {}: ShellExecuteW returned {}",
+                target, result_code
+            ))
         }
     }
 

@@ -21,6 +21,10 @@ import {
   type LearningWindowOptions,
 } from "@/lib/first-run/use-learning-window";
 import { FirstRunNextSteps } from "@/components/first-run/next-steps";
+import {
+  dismissFirstRunSearchShortcutFromParent,
+  FirstRunSearchShortcutPractice,
+} from "@/components/first-run/search-shortcut-practice";
 import type { AgentHandoffTarget } from "@/lib/first-run/agent-handoff";
 
 function CapturedAppIcon({ app }: { app: FirstRunCapturedApp }) {
@@ -32,7 +36,7 @@ function CapturedAppIcon({ app }: { app: FirstRunCapturedApp }) {
       className="flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden border border-border text-[10px] font-medium uppercase text-muted-foreground"
     >
       {failed ? (
-        (app.name.trim().charAt(0) || "?")
+        app.name.trim().charAt(0) || "?"
       ) : (
         // Icons come from the local app server, not a remote host, so
         // next/image optimization does not apply. Same as the timeline.
@@ -67,8 +71,8 @@ export function FirstRunReadyPanel({
     <div>
       <div className="p-5">
         <div className="flex items-center gap-2">
-          <span className="h-2 w-2 bg-phosphor-strong" aria-hidden="true" />
-          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-phosphor-strong">
+          <span className="h-2 w-2 bg-signal" aria-hidden="true" />
+          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-signal">
             first result · ready
           </span>
         </div>
@@ -82,7 +86,7 @@ export function FirstRunReadyPanel({
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <Button
             size="sm"
-            className="h-8 border-phosphor-strong bg-phosphor px-3 text-[10px] text-phosphor-ink hover:border-foreground hover:bg-foreground hover:text-background"
+            className="h-8 border-foreground bg-foreground px-3 text-[10px] text-background hover:bg-background hover:text-foreground"
             data-testid="first-run-open-summary"
             onClick={onOpenSummary}
           >
@@ -106,7 +110,7 @@ export function FirstRunReadyPanel({
       <div className="flex items-center justify-between gap-4 border-t border-border px-4 py-3">
         <p className="text-[10px] leading-relaxed text-muted-foreground">
           screenpipe is ready now. these optional setups remain available from
-          scheduled tasks and connections.
+          Automations and Connections.
         </p>
         <Button
           size="sm"
@@ -132,8 +136,8 @@ export function FirstRunSetupReadyPanel({
     <div data-testid="first-run-setup-ready">
       <div className="p-5">
         <div className="flex items-center gap-2">
-          <span className="h-2 w-2 bg-phosphor-strong" aria-hidden="true" />
-          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-phosphor-strong">
+          <span className="h-2 w-2 bg-signal" aria-hidden="true" />
+          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-signal">
             setup · ready
           </span>
         </div>
@@ -150,8 +154,8 @@ export function FirstRunSetupReadyPanel({
 
       <div className="flex items-center justify-between gap-4 border-t border-border px-4 py-3">
         <p className="text-[10px] leading-relaxed text-muted-foreground">
-          these optional setups remain available from scheduled tasks and
-          connections.
+          these optional setups remain available from Automations and
+          Connections.
         </p>
         <Button
           size="sm"
@@ -179,11 +183,11 @@ export function FirstRunSetupDock({
   return (
     <div data-testid="first-run-setup-dock">
       <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center">
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center border border-phosphor-strong text-phosphor-strong">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center border border-signal text-signal">
           <ListChecks className="h-4 w-4" aria-hidden="true" />
         </span>
         <div className="min-w-0 flex-1">
-          <p className="font-mono text-[9px] uppercase tracking-[0.2em] text-phosphor-strong">
+          <p className="font-mono text-[9px] uppercase tracking-[0.2em] text-signal">
             getting started
           </p>
           <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
@@ -217,7 +221,7 @@ export function FirstRunSetupDock({
             data-testid="first-run-hide-setup"
             onClick={onDismiss}
           >
-            hide
+            hide tips
           </Button>
         </div>
       </div>
@@ -247,8 +251,11 @@ export function FirstRunLearningBanner(
     markSummaryOpened,
     dismiss,
   } = useLearningWindow(learningOptions);
-  const { targets: handoffTargets, hint: handoffHint, askAgent } =
-    useAgentHandoff(phase === "ready" && !summaryOpenedAt);
+  const {
+    targets: handoffTargets,
+    hint: handoffHint,
+    askAgent,
+  } = useAgentHandoff(phase === "ready" && !summaryOpenedAt);
 
   // Only show progress when setup just caused it. A foreground empty result is
   // still a terminal onboarding state: hiding it also hid the daily-summary
@@ -289,8 +296,12 @@ export function FirstRunLearningBanner(
           data-phase="ready"
           className="mx-auto mb-4 w-full max-w-3xl overflow-hidden border border-border bg-background"
         >
+          <FirstRunSearchShortcutPractice />
           <FirstRunSetupDock
-            onDismiss={() => dismiss()}
+            onDismiss={() => {
+              dismissFirstRunSearchShortcutFromParent();
+              dismiss();
+            }}
             nextSteps={
               <FirstRunNextSteps userToken={learningOptions.userToken} />
             }
@@ -361,8 +372,8 @@ export function FirstRunLearningBanner(
               ceiling, so a timer here would tick to 0:00 and then keep
               spinning. */}
           <p className="text-[11px] leading-relaxed text-muted-foreground">
-            Screenpipe saw enough. Putting the summary together now — this
-            takes a few seconds.
+            Screenpipe saw enough. Putting the summary together now — this takes
+            a few seconds.
           </p>
           {capturedApps.length > 0 && (
             <div className="flex items-center gap-2 pt-0.5">
@@ -386,14 +397,18 @@ export function FirstRunLearningBanner(
           onOpenSummary={() => void openSummary()}
           onPickAgent={(target) => void askAgent(target)}
           onDismiss={() => dismiss()}
-          nextSteps={<FirstRunNextSteps userToken={learningOptions.userToken} />}
+          nextSteps={
+            <FirstRunNextSteps userToken={learningOptions.userToken} />
+          }
         />
       )}
 
       {phase === "empty" && (
         <FirstRunSetupReadyPanel
           onDismiss={() => dismiss()}
-          nextSteps={<FirstRunNextSteps userToken={learningOptions.userToken} />}
+          nextSteps={
+            <FirstRunNextSteps userToken={learningOptions.userToken} />
+          }
         />
       )}
     </section>

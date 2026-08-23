@@ -477,6 +477,14 @@ async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> 
     else return { status: "error", error: e  as any };
 }
 },
+async generateActivityHistory(start: string, end: string) : Promise<Result<PersistedActivityHistory, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_activity_history", { start, end }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Absolute path of the data directory used by the running engine. This is
  * distinct from the app base directory when the user selected a custom
@@ -485,6 +493,14 @@ async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> 
 async getActiveDataDir() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_active_data_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getActivityHistory(start: string, end: string) : Promise<Result<PersistedActivityHistory, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_activity_history", { start, end }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -605,8 +621,9 @@ async getEnterpriseInstallMetadata() : Promise<EnterpriseInstallMetadata> {
     return await TAURI_INVOKE("get_enterprise_install_metadata");
 },
 /**
- * Read the enterprise license key from `enterprise.json`.
- * Returns None if no file is found or is invalid.
+ * Read the enterprise license key from deployment config (`enterprise.json`
+ * or the documented Windows registry value) and the user recovery config.
+ * Returns None if no valid key is found.
  */
 async getEnterpriseLicenseKey() : Promise<string | null> {
     return await TAURI_INVOKE("get_enterprise_license_key");
@@ -868,8 +885,8 @@ async installBrainViewTemplateKit(request: InstallBrainViewTemplateKitRequest) :
 },
 /**
  * Install the two built-in screenpipe skills into a supported external agent.
- * Explicit Settings actions still call this narrow command; first-run native
- * background setup shares the same engine skill installer directly.
+ * Explicit Settings actions still call this narrow command; native launch
+ * reconciliation shares the same engine skill installer directly.
  */
 async installExternalAgentSkills(target: string) : Promise<Result<string[], string>> {
     try {
@@ -982,6 +999,14 @@ async listChatEntriesByMtime(dir: string) : Promise<Result<ChatDirEntry[], strin
 async listImportedSkills() : Promise<Result<ImportedSkill[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_imported_skills") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listManagedTeamSkills() : Promise<Result<ManagedTeamSkillLocal[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_managed_team_skills") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1100,6 +1125,20 @@ async loadBrainViewCanvas(viewId: string) : Promise<Result<BrainViewCanvasDocume
 async lockSync() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("lock_sync") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Apply one provider-owned schedule mutation through a live ACP adapter that
+ * negotiated the Screenpipe schedule extension. This fails closed when the
+ * task, capability, owning session, or provider confirmation disappeared
+ * since the UI's last refresh.
+ */
+async manageProviderAutomation(key: string, action: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("manage_provider_automation", { key, action }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1426,6 +1465,19 @@ async piAcpAgentInstallStatus(agentId: string) : Promise<AcpAgentInstallStatus> 
     return await TAURI_INVOKE("pi_acp_agent_install_status", { agentId });
 },
 /**
+ * Launch a built-in agent's own browser login after an explicit user click.
+ * The catalog supplies the argv, the process runs hidden as the desktop user,
+ * and the agent keeps the resulting credential in its own local store.
+ */
+async piAcpExternalLogin(agentId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_acp_external_login", { agentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Probe an ACP adapter for its advertised model/mode selectors without a
  * chat: spawn the hidden runtime, let it initialize and create a session,
  * capture the acp_session_config event, and tear everything down. Returns
@@ -1450,6 +1502,18 @@ async piAcpProbeAgent(agent: AcpAgentConfig) : Promise<Result<string, string>> {
 async piAcpReauthenticate(sessionId: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pi_acp_reauthenticate", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Change Screenpipe's response policy for ACP permission requests without
+ * pretending it is an adapter-owned session mode.
+ */
+async piAcpSetApprovalMode(sessionId: string | null, approvalMode: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_acp_set_approval_mode", { sessionId, approvalMode }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1713,6 +1777,22 @@ async piSteerQueued(sessionId: string | null, promptId: string) : Promise<Result
 async piStop(sessionId: string | null) : Promise<Result<PiInfo, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pi_stop", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Stop and forget an idle Pi session without interrupting in-flight work.
+ *
+ * Chat panels call this when they give up foreground ownership. Keeping every
+ * completed ACP conversation resident leaves a full Bun/Node/agent process
+ * tree behind for each chat. The busy check and removal happen under the pool
+ * lock, so a prompt cannot race between the check and teardown.
+ */
+async piStopIfIdle(sessionId: string | null) : Promise<Result<PiInfo, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_stop_if_idle", { sessionId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2181,6 +2261,18 @@ async searchNavigateToTimeline(timestamp: string, frameId: number | null, search
 }
 },
 /**
+ * Persist the user's explicit Settings choice. Automatic launch reconciliation
+ * skips opted-out targets until the user explicitly connects them again.
+ */
+async setAiToolAutoConnectOptOut(target: string, optOut: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_ai_tool_auto_connect_opt_out", { target, optOut }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Persist a user-supplied API auth key to the secret store.
  * The running server keeps its in-memory key until restart.
  */
@@ -2324,6 +2416,35 @@ async setEnhancedAiSuggestions(enabled: boolean, token: string) : Promise<Result
  */
 async setEnterprisePolicy(hiddenSections: string[], enforceAutoStart: boolean) : Promise<void> {
     await TAURI_INVOKE("set_enterprise_policy", { hiddenSections, enforceAutoStart });
+},
+/**
+ * Request or revoke Enterprise recording access. A webview may always revoke
+ * its current session, but it cannot grant itself access: native code verifies
+ * the supplied key/account credential against both the Enterprise policy and
+ * seat-bearing heartbeat endpoints before setting the process-local grant.
+ *
+ * The grant is never persisted. Every launch must revalidate against the
+ * control plane, and an explicit credential rejection revokes it immediately.
+ */
+async setEnterpriseRecordingAuthorized(authorized: boolean, credentialType: string | null, credential: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_enterprise_recording_authorized", { authorized, credentialType, credential }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Apply the frontend's experimental rollout decision to native history swipes.
+ * The platform implementation keeps every non-Home webview forced off.
+ */
+async setHistorySwipeNavigationEnabled(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_history_swipe_navigation_enabled", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async setKeepAwake(enabled: boolean) : Promise<Result<null, string>> {
     try {
@@ -2593,6 +2714,19 @@ async suspendGlobalShortcuts() : Promise<Result<null, string>> {
 }
 },
 /**
+ * Apply the exact organization-managed skill desired state. Only directories
+ * written by this command (namespaced + marker-checked) can be refreshed or
+ * pruned; personal skills and unrelated agent configuration are untouched.
+ */
+async syncManagedTeamSkills(skills: ManagedTeamSkill[], pruneUnlisted: boolean) : Promise<Result<ManagedTeamSkillReceipt[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_managed_team_skills", { skills, pruneUnlisted }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Verifies an OpenAI-compatible endpoint with the exact request path and
  * audio encoding used by the recording engine. A successful response is
  * required before the settings UI can activate this engine, so recordings
@@ -2791,6 +2925,11 @@ config?: { [key in string]: string };
  */
 modeId?: string | null;
 /**
+ * Screenpipe-owned permission response policy. `allow-all` approves each
+ * adapter request; omitted or `ask` keeps the normal approval cards.
+ */
+approvalMode?: string | null;
+/**
  * Send the agent's model calls through Screenpipe Cloud instead of the
  * user's own provider account. Only honoured for agents whose catalog
  * entry declares `cloudRouting`; a closed agent (Cursor, Copilot) talks to
@@ -2819,7 +2958,19 @@ config?: { [key in string]: string };
 /**
  * Default session mode id, applied after every session/new.
  */
-modeId?: string | null }
+modeId?: string | null;
+/**
+ * Screenpipe-owned ACP permission response policy (`ask` or `allow-all`).
+ */
+approvalMode?: string | null;
+/**
+ * Send this agent's model calls through Screenpipe Cloud. `None` keeps
+ * presets saved before this choice on the agent's own provider account.
+ */
+useScreenpipeCloud?: boolean | null }
+export type ActivityHistoryCoverage = { start: string; end: string }
+export type ActivityHistoryEntry = { id: string; kind: string; meeting_id: number | null; start_at: string; end_at: string; title: string; summary: string; evidence: ActivityHistoryEvidence[] }
+export type ActivityHistoryEvidence = { kind: string; at: string; frame_id: number | null; meeting_id: number | null; app_name: string | null; label: string }
 export type AecMode = "off" | "screenpipe" | "macos" | "windows"
 export type AudioDeviceInfo = { name: string; isDefault: boolean;
 /**
@@ -2994,6 +3145,40 @@ export type LoginMode = "sign-in" | "sign-up"
  * from drifting away from the values enforced by the capture engine.
  */
 export type LowDiskGuardConfig = { thresholdBytes: number; checkIntervalSeconds: number }
+/**
+ * A reviewed organization skill delivered by the Enterprise policy endpoint.
+ * Package files contain no credentials or device-specific filesystem paths.
+ */
+export type ManagedTeamSkill = { artifact_id: string;
+/**
+ * Desired-state revision. Assignment changes bump this value.
+ */
+version: number;
+/**
+ * Immutable package release.
+ */
+release_version: number; name: string; description?: string; package: ManagedTeamSkillPackage; destinations?: string[] }
+/**
+ * Read-only summary rendered in Settings. Organization-managed skills are
+ * deliberately separate from user-imported skills and cannot be removed there.
+ */
+export type ManagedTeamSkillLocal = { artifact_id: string; version: number; release_version: number; digest: string; name: string; description: string; file_count: number; discovery_chars: number; activation_chars: number; has_scripts: boolean; destinations: string[] }
+/**
+ * A portable Agent Skills directory. The server freezes the exact text files;
+ * each device verifies the per-file and aggregate digests before installation.
+ */
+export type ManagedTeamSkillPackage = { format: string; package_version: number; entrypoint: string; digest: string; name: string; description: string; files: ManagedTeamSkillPackageFile[]; context: ManagedTeamSkillPackageContext; risk: ManagedTeamSkillPackageRisk }
+export type ManagedTeamSkillPackageContext = { discovery_chars: number; activation_chars: number }
+export type ManagedTeamSkillPackageFile = { path: string; content: string; sha256: string; bytes: number }
+export type ManagedTeamSkillPackageRisk = { has_scripts: boolean }
+/**
+ * Per-destination receipt from the most recent managed sync attempt.
+ */
+export type ManagedTeamSkillReceipt = { artifact_id: string; version: number; release_version: number; digest: string; destination: string;
+/**
+ * `installed` or `error`. Errors never prevent the other destinations.
+ */
+status: string; detail?: string | null }
 export type MeetingExportSummary = { job_id: string; output_path: string; frame_count: number; audio_chunk_count: number; duration_secs: number; file_size_bytes: number }
 export type MonitorDevice = { id: number; stableId: string; name: string; isDefault: boolean; width: number; height: number }
 export type NotificationActionEvent = { actionType: string | null; rawJson: string; payload: JsonValue }
@@ -3029,6 +3214,7 @@ downloaded: boolean;
  * True when download failed with 401/403 — user must sign in.
  */
 auth_required: boolean }
+export type PersistedActivityHistory = { entries: ActivityHistoryEntry[]; coverage: ActivityHistoryCoverage[] }
 export type PiBackend = "acp"
 export type PiCheckResult = { available: boolean; path: string | null }
 export type PiExtensionPackage = { source: string; scope: string; filtered: boolean; installed: boolean;
@@ -3143,9 +3329,17 @@ schedule: string; scheduleLabel: string | null; status: string;
  */
 executionScope: string;
 /**
- * Read-only until the provider exposes a supported lifecycle API.
+ * `read_only` or `in_app` after a live ACP capability negotiation.
  */
-manageability: string; lifecycleNote: string; updatedAtMs: number | null }
+manageability: string;
+/**
+ * Mutations currently supported by a live, capability-negotiated adapter.
+ */
+availableActions?: string[]; lifecycleNote: string;
+/**
+ * Opaque provider revision returned on the next mutation for conflict checks.
+ */
+revision?: string | null; updatedAtMs: number | null }
 /**
  * A skill offered by the curated registry. Installing one downloads its folder
  * (the directory containing `SKILL.md`) from a public GitHub repo into the
@@ -3825,6 +4019,11 @@ deviceId?: string;
  * When disabled, users must click "update now" in the tray menu.
  */
 autoUpdate?: boolean;
+/**
+ * Consumer updater channel selected on this device. Older stores omit it
+ * and therefore remain on the stable channel.
+ */
+updateChannel?: string;
 /**
  * Auto-update store-installed pipes that haven't been locally modified.
  */

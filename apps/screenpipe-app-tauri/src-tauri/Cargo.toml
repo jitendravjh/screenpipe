@@ -7,7 +7,7 @@ members = ["wer-dump-helper"]
 
 [package]
 name = "screenpipe-app"
-version = "2.6.64"
+version = "2.6.80"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -34,7 +34,6 @@ tauri = { version = "=2.11.2", features = [
   "protocol-asset",
   "macos-private-api",
   "tray-icon",
-  "devtools",
   "image-png",
   "image-ico",
   # Embedded child webview (the agent-controlled browser sidebar) requires
@@ -50,11 +49,6 @@ tauri-plugin-updater = "=2.10.1"
 semver = "1"
 # staged-update signature re-verification (same crate/version the updater plugin uses)
 minisign-verify = "0.2"
-# staged-update pre-extraction at download time — the exit path must be two
-# renames, not a 400 MB gunzip in the dying process (same crates/versions the
-# updater plugin already pulls in)
-flate2 = "1"
-tar = "0.4"
 tauri-plugin-dialog = "=2.6.0"
 tauri-plugin-os = "=2.3.2"
 tauri-plugin-process = "=2.3.1"
@@ -66,6 +60,7 @@ tauri-plugin-permission-flow = { git = "https://github.com/EzraEllette/permissio
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 toml = "0.8"
 base64 = "0.22"
 bytes = "1"
@@ -129,7 +124,6 @@ raw-window-handle = "0.6"
 
 notify = "8.0.0"
 futures = "0.3.30"
-agent-client-protocol = { version = "=1.2.0", features = ["unstable_auth_methods"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
 chrono = "0.4.39"
@@ -143,7 +137,7 @@ async-trait = "0.1"
 hostname = "0.4"
 
 # Screenpipe core (for sync)
-screenpipe-core = { path = "../../../crates/screenpipe-core", features = ["cloud-sync", "secrets"] }
+screenpipe-core = { path = "../../../crates/screenpipe-core", features = ["cloud-sync", "secrets", "acp"] }
 
 # Embedded screenpipe server
 screenpipe-config = { path = "../../../crates/screenpipe-config", features = ["specta"] }
@@ -288,7 +282,7 @@ pulseaudio = ["screenpipe-audio/pulseaudio"]
 directml = ["screenpipe-engine/directml"]
 vulkan = ["screenpipe-audio/vulkan"]
 cargo-clippy = []
-e2e = ["tauri-plugin-webdriver", "dep:sqlx"]
+e2e = ["tauri-plugin-webdriver", "dep:sqlx", "screenpipe-screen/e2e"]
 
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]

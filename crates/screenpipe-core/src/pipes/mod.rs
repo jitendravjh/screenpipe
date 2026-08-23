@@ -21,6 +21,7 @@ pub mod sync;
 pub(crate) mod trajectory;
 
 use crate::agents::{
+    cloud::CloudAgentConfig,
     pi::{pi_event_protocol_error, pi_package_enabled, PiExecutor},
     AgentExecutor, ExecutionHandle, SharedPid, STOP_REQUESTED_PID,
 };
@@ -268,6 +269,10 @@ pub struct PipeConfig {
     /// LLM provider override.  Default: none (uses screenpipe cloud).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Run this pipe in a user-owned provider cloud instead of a local Pi
+    /// process. Context leaves the device only when the nested opt-in is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_agent: Option<CloudAgentConfig>,
     /// Reasoning effort used for every run. Background automation defaults to
     /// low so recurring work does not inherit Pi's more expensive chat default.
     #[serde(default, skip_serializing_if = "is_default_effort")]
@@ -382,6 +387,30 @@ pub struct PipeConfig {
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, serde_json::Value>,
+}
+
+struct CloudAgentRunSettings {
+    model: String,
+    provider: String,
+    executor_config: serde_json::Value,
+}
+
+fn cloud_agent_run_settings(
+    config: &PipeConfig,
+    task_instructions: &str,
+) -> Result<CloudAgentRunSettings> {
+    let cloud = config
+        .cloud_agent
+        .as_ref()
+        .ok_or_else(|| anyhow!("cloud_agent config is missing"))?;
+    Ok(CloudAgentRunSettings {
+        model: cloud
+            .model
+            .clone()
+            .unwrap_or_else(|| "provider-default".into()),
+        provider: cloud.provider.as_str().to_string(),
+        executor_config: cloud.executor_config(task_instructions),
+    })
 }
 
 /// Cross-provider reasoning effort exposed by Pipes.
@@ -1466,6 +1495,11 @@ pub struct ResolvedPreset {
     pub api_key: Option<String>,
     /// System prompt from the preset (injected before the pipe body).
     pub prompt: Option<String>,
+    /// Optional executor override. ACP presets use the desktop ACP runtime;
+    /// raw presets keep the pipe's configured executor (normally Pi).
+    pub executor: Option<String>,
+    /// Opaque preset data consumed by the selected executor.
+    pub executor_config: Option<serde_json::Value>,
 }
 
 /// Read the ChatGPT OAuth access token, with auto-refresh if expired.
@@ -1730,9 +1764,9 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
     };
 
     let preset = if normalized_id == "default" {
-        // An ACP chat preset cannot run in the headless raw-Pi scheduler. If
-        // it is the user's default, preserve existing pipes by preferring the
-        // dedicated `pipes` preset, then another compatible raw preset.
+        // Preserve existing scheduled behavior when the user's chat default is
+        // ACP: only an explicit pipe selection opts into the ACP executor.
+        // Otherwise prefer the dedicated `pipes` preset, then another raw one.
         presets
             .iter()
             .filter(|preset| is_pipe_compatible(preset))
@@ -1760,18 +1794,34 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             })
     }?;
 
-    // ACP presets launch an interactive desktop harness through the Tauri
-    // bridge. The headless pipe runtime still uses raw Pi, so treating the ACP
-    // adapter id as a model would silently route to the wrong provider.
-    if preset.get("provider").and_then(|value| value.as_str()) == Some("acp") {
-        warn!(
-            "preset '{}' uses ACP and is not available to the raw Pi pipe runtime",
-            preset_id
-        );
-        return None;
-    }
-
-    let model = preset.get("model")?.as_str()?.to_string();
+    let is_acp = preset.get("provider").and_then(|value| value.as_str()) == Some("acp");
+    let executor_config = if is_acp {
+        preset.get("acpAgent").cloned().or_else(|| {
+            preset
+                .get("model")
+                .and_then(|value| value.as_str())
+                .map(|id| serde_json::json!({ "id": id }))
+        })
+    } else {
+        None
+    };
+    let model = if is_acp {
+        executor_config
+            .as_ref()
+            .and_then(|config| config.get("config"))
+            .and_then(|value| value.get("model"))
+            .and_then(|value| value.as_str())
+            .or_else(|| preset.get("model").and_then(|value| value.as_str()))
+            .or_else(|| {
+                executor_config
+                    .as_ref()
+                    .and_then(|config| config.get("id"))
+                    .and_then(|value| value.as_str())
+            })?
+            .to_string()
+    } else {
+        preset.get("model")?.as_str()?.to_string()
+    };
 
     // Map app provider types to pipe provider strings
     let provider = preset
@@ -1784,6 +1834,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             "openai-chatgpt" => Some("openai-chatgpt"),
             "anthropic" => Some("anthropic"),
             "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
+            "acp" => Some("acp"),
             _ => None,
         })
         .map(|s| s.to_string());
@@ -1818,6 +1869,8 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         url,
         api_key,
         prompt,
+        executor: is_acp.then(|| "acp".to_string()),
+        executor_config,
     })
 }
 
@@ -1837,9 +1890,6 @@ fn list_available_preset_ids(pipes_dir: &Path) -> Vec<String> {
         .and_then(|p| p.as_array())
         .map(|arr| {
             arr.iter()
-                .filter(|preset| {
-                    preset.get("provider").and_then(|value| value.as_str()) != Some("acp")
-                })
                 .filter_map(|p| p.get("id").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()
         })
@@ -2305,19 +2355,6 @@ fn emit_pipe_start(
     callback(pipe_name, execution_id, continues_chat, &event);
 }
 
-/// Async predicate: given a pipe's required connections, return the
-/// subset that is NOT yet configured (`enabled && credentials present`).
-/// Returning an empty vec means "all connections are ready, pipe may run".
-///
-/// Injected from the engine layer (which owns the SecretStore + screenpipe
-/// dir) to keep the scheduler in `screenpipe-core` free of a
-/// `screenpipe-connect` dep — that crate already depends on us.
-pub type ConnectionCheck = Arc<
-    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
-        + Send
-        + Sync,
->;
-
 /// Default execution timeout: 10 minutes.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
@@ -2450,10 +2487,6 @@ pub struct PipeManager {
     on_run_complete: Option<OnPipeRunComplete>,
     /// Optional callback fired for each stdout line from a running pipe.
     on_output_line: Option<OnPipeOutputLine>,
-    /// Optional async predicate that returns the missing connections for a
-    /// pipe. If set, the scheduler skips any enabled pipe whose required
-    /// connections aren't all configured ("setup mode").
-    connection_check: Option<ConnectionCheck>,
     /// Optional persistence store (None in CLI mode).
     store: Option<Arc<dyn PipeStore>>,
     /// API port for prompt rendering (default 3030).
@@ -2509,7 +2542,6 @@ impl PipeManager {
             scheduler_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             on_run_complete: None,
             on_output_line: None,
-            connection_check: None,
             store,
             api_port,
             max_non_template_pipes: None,
@@ -2621,14 +2653,6 @@ impl PipeManager {
     /// Set a callback to be invoked after each scheduled pipe run.
     pub fn set_on_run_complete(&mut self, cb: OnPipeRunComplete) {
         self.on_run_complete = Some(cb);
-    }
-
-    /// Set the async predicate used to gate scheduled runs on connection
-    /// readiness. Without this, pipes "in setup mode" (enabled but missing
-    /// required integrations) would still tick on their cron / event
-    /// trigger and run with broken credentials.
-    pub fn set_connection_check(&mut self, cb: ConnectionCheck) {
-        self.connection_check = Some(cb);
     }
 
     /// Set a callback to be invoked for each stdout line from a running pipe.
@@ -3436,19 +3460,6 @@ impl PipeManager {
             }
         };
 
-        let executor = self
-            .executors
-            .get(&config.agent)
-            .ok_or_else(|| anyhow!("agent '{}' not available", config.agent))?
-            .clone();
-
-        if !executor.is_available() {
-            return Err(anyhow!(
-                "agent '{}' is not installed — run ensure_installed first",
-                config.agent
-            ));
-        }
-
         // Shared PID — updated synchronously by the executor as soon as the
         // subprocess spawns. The stop API can set an early-stop sentinel on
         // this atomic before the PID exists.
@@ -3495,12 +3506,28 @@ impl PipeManager {
         // and a self-PID file would make the next startup SIGKILL the app.
         write_pid_file(&self.pipes_dir, name, 0);
 
-        // Resolve preset
-        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) = if let Some(
-            preset_id,
-        ) =
-            config.preset.first()
-        {
+        // Resolve the selected runner and its provider-specific configuration.
+        let (
+            run_model,
+            run_provider,
+            run_provider_url,
+            run_api_key,
+            preset_prompt,
+            run_agent,
+            run_executor_config,
+        ) = if config.agent == "cloud-agent" {
+            let cloud = cloud_agent_run_settings(&config, &body)
+                .map_err(|error| anyhow!("pipe '{}': {error}", name))?;
+            (
+                cloud.model,
+                Some(cloud.provider),
+                None,
+                None,
+                None,
+                "cloud-agent".to_string(),
+                Some(cloud.executor_config),
+            )
+        } else if let Some(preset_id) = config.preset.first() {
             match resolve_preset(&self.pipes_dir, preset_id) {
                 Some(resolved) => (
                     resolved.model,
@@ -3508,6 +3535,8 @@ impl PipeManager {
                     resolved.url,
                     resolved.api_key,
                     resolved.prompt,
+                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                    resolved.executor_config,
                 ),
                 None if is_enterprise_managed(&config) => {
                     remove_pid_file(&self.pipes_dir, name);
@@ -3525,6 +3554,8 @@ impl PipeManager {
                     None,
                     None,
                     None,
+                    config.agent.clone(),
+                    None,
                 ),
             }
         } else {
@@ -3536,6 +3567,8 @@ impl PipeManager {
                     resolved.url,
                     resolved.api_key,
                     resolved.prompt,
+                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                    resolved.executor_config,
                 ),
                 None => (
                     config.model.clone(),
@@ -3543,7 +3576,26 @@ impl PipeManager {
                     None,
                     None,
                     None,
+                    config.agent.clone(),
+                    None,
                 ),
+            }
+        };
+
+        let executor = match self.executors.get(&run_agent) {
+            Some(executor) if executor.is_available() => executor.clone(),
+            Some(_) => {
+                remove_pid_file(&self.pipes_dir, name);
+                self.running.lock().await.remove(name);
+                return Err(anyhow!(
+                    "agent '{}' is not installed — open the desktop app and retry",
+                    run_agent
+                ));
+            }
+            None => {
+                remove_pid_file(&self.pipes_dir, name);
+                self.running.lock().await.remove(name);
+                return Err(anyhow!("agent '{}' not available", run_agent));
             }
         };
 
@@ -3612,7 +3664,7 @@ impl PipeManager {
             preset_prompt.as_deref(),
             self.connections_context.as_deref(),
             self.local_api_key.as_deref(),
-            config.agent == "pi" && pi_package_enabled("pi-subagents"),
+            run_agent == "pi" && pi_package_enabled("pi-subagents"),
         );
         let combined_context = match (self.extra_context.as_deref(), run_context) {
             (Some(shared), Some(scoped)) => Some(format!("{shared}\n{scoped}")),
@@ -3654,7 +3706,7 @@ impl PipeManager {
 
         // Pre-configure pi
         let mut pipe_token: Option<String> = None;
-        if config.agent == "pi" {
+        if run_agent == "pi" {
             let cloud_token = executor.user_token();
             if let Err(e) = PiExecutor::ensure_pi_config(
                 cloud_token.as_deref(),
@@ -3667,7 +3719,8 @@ impl PipeManager {
             {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
-
+        }
+        if matches!(run_agent.as_str(), "pi" | "acp") {
             pipe_token =
                 setup_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await;
         }
@@ -3760,6 +3813,7 @@ impl PipeManager {
                     // sidebar shows navigations when the user is watching this
                     // pipe.
                     Some(session_owner.as_str()),
+                    run_executor_config.as_ref(),
                 ),
             )
             .await;
@@ -3997,20 +4051,6 @@ impl PipeManager {
                 }
             };
 
-            let executor = self
-                .executors
-                .get(&config.agent)
-                .ok_or_else(|| anyhow!("agent '{}' not available", config.agent))?
-                .clone();
-
-            // Check agent is available
-            if !executor.is_available() {
-                return Err(anyhow!(
-                    "agent '{}' is not installed — run ensure_installed first",
-                    config.agent
-                ));
-            }
-
             let shared_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let handle = ExecutionHandle::new(shared_pid.clone());
             let run_handle = handle.clone();
@@ -4065,7 +4105,23 @@ impl PipeManager {
                 preset_prompt,
                 active_preset_id,
                 active_preset_idx,
-            ) = if !config.preset.is_empty() {
+                run_agent,
+                run_executor_config,
+            ) = if config.agent == "cloud-agent" {
+                let cloud = cloud_agent_run_settings(&config, &body)
+                    .map_err(|error| anyhow!("pipe '{}': {error}", name))?;
+                (
+                    cloud.model,
+                    Some(cloud.provider),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "cloud-agent".to_string(),
+                    Some(cloud.executor_config),
+                )
+            } else if !config.preset.is_empty() {
                 // Pick the best available preset using the circuit breaker, but
                 // start at `retry_depth` so an in-run fallback retry advances to
                 // the next preset even when the failed one's breaker never
@@ -4097,6 +4153,8 @@ impl PipeManager {
                             resolved.prompt,
                             Some(preset_id.to_string()),
                             Some(idx),
+                            resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                            resolved.executor_config,
                         )
                     }
                     None => {
@@ -4136,6 +4194,8 @@ impl PipeManager {
                             resolved.prompt,
                             None,
                             None,
+                            resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                            resolved.executor_config,
                         )
                     }
                     None => {
@@ -4148,8 +4208,27 @@ impl PipeManager {
                             None,
                             None,
                             None,
+                            config.agent.clone(),
+                            None,
                         )
                     }
+                }
+            };
+
+            let executor = match self.executors.get(&run_agent) {
+                Some(executor) if executor.is_available() => executor.clone(),
+                Some(_) => {
+                    remove_pid_file(&self.pipes_dir, name);
+                    self.running.lock().await.remove(name);
+                    return Err(anyhow!(
+                        "agent '{}' is not installed — open the desktop app and retry",
+                        run_agent
+                    ));
+                }
+                None => {
+                    remove_pid_file(&self.pipes_dir, name);
+                    self.running.lock().await.remove(name);
+                    return Err(anyhow!("agent '{}' not available", run_agent));
                 }
             };
 
@@ -4189,10 +4268,9 @@ impl PipeManager {
                 preset_prompt.as_deref(),
                 self.connections_context.as_deref(),
                 self.local_api_key.as_deref(),
-                config.agent == "pi" && pi_package_enabled("pi-subagents"),
+                run_agent == "pi" && pi_package_enabled("pi-subagents"),
             );
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
-
             let shared_pid_for_kill = shared_pid.clone();
 
             // Mark as running in DB
@@ -4219,7 +4297,7 @@ impl PipeManager {
             // Pre-configure pi with the pipe's provider so models.json has the
             // right entry before the agent subprocess starts.
             let mut pipe_token: Option<String> = None;
-            if config.agent == "pi" {
+            if run_agent == "pi" {
                 if let Err(e) = PiExecutor::ensure_pi_config(
                     None,
                     executor.screenpipe_api_url(),
@@ -4231,7 +4309,8 @@ impl PipeManager {
                 {
                     warn!("failed to pre-configure pi provider: {}", e);
                 }
-
+            }
+            if matches!(run_agent.as_str(), "pi" | "acp") {
                 pipe_token = setup_pipe_permissions(
                     &self.pipes_dir.join(name),
                     &config,
@@ -4312,6 +4391,7 @@ impl PipeManager {
                     // sidebar shows navigations when the user is watching this
                     // pipe.
                     Some(session_owner.as_str()),
+                    run_executor_config.as_ref(),
                 ),
             )
             .await;
@@ -4681,6 +4761,17 @@ impl PipeManager {
                 "provider" => {
                     if let Some(s) = v.as_str() {
                         config.provider = Some(s.to_string());
+                    }
+                }
+                "cloud_agent" => {
+                    if v.is_null() {
+                        config.cloud_agent = None;
+                    } else {
+                        config.cloud_agent = Some(
+                            serde_json::from_value::<CloudAgentConfig>(v.clone()).map_err(|e| {
+                                anyhow!("invalid cloud_agent config for '{}': {}", name, e)
+                            })?,
+                        );
                     }
                 }
                 "effort" => {
@@ -5071,6 +5162,7 @@ impl PipeManager {
             ));
         }
         delete_pi_sessions(&pipe_dir)?;
+        let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-acp-sessions.json"));
         info!("cleared history for pipe '{}'", name);
         Ok(())
     }
@@ -5172,7 +5264,6 @@ impl PipeManager {
         let pipes_dir = self.pipes_dir.clone();
         let on_run_complete = self.on_run_complete.clone();
         let on_output_line = self.on_output_line.clone();
-        let connection_check = self.connection_check.clone();
         let store = self.store.clone();
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
@@ -5559,91 +5650,6 @@ impl PipeManager {
                         }
                     }
 
-                    // Setup-mode gate: pipes whose declared `connections` aren't
-                    // all configured (credentials or OAuth token present) must not
-                    // run on schedule or event. Mirrors the manual-run gate in
-                    // pipes_api::run_pipe_now. Placed after the schedule/queue
-                    // checks so we only hit the SecretStore when the pipe would
-                    // otherwise be about to start.
-                    if !config.connections.is_empty() {
-                        if let Some(check) = &connection_check {
-                            let missing = check(config.connections.clone()).await;
-                            if !missing.is_empty() {
-                                let skipped_at = Utc::now();
-                                let message = format!(
-                                    "pipe '{}' skipped: missing required connections: {}",
-                                    name,
-                                    missing.join(", ")
-                                );
-                                warn!(
-                                    "scheduler: pipe '{}' in setup mode (missing connections: {:?}), skipping",
-                                    name, missing
-                                );
-                                last_run.insert(name.clone(), skipped_at);
-                                let mut execution_id = None;
-                                if let Some(ref store) = store {
-                                    match store
-                                        .create_execution(
-                                            name,
-                                            trigger,
-                                            &config.model,
-                                            config.provider.as_deref(),
-                                        )
-                                        .await
-                                    {
-                                        Ok(id) => {
-                                            execution_id = Some(id);
-                                            let _ = store
-                                                .finish_execution(
-                                                    id,
-                                                    "failed",
-                                                    "",
-                                                    &message,
-                                                    None,
-                                                    Some("missing_connections"),
-                                                    Some(&message),
-                                                    None,
-                                                )
-                                                .await;
-                                        }
-                                        Err(e) => {
-                                            warn!("failed to create skipped execution row: {}", e);
-                                        }
-                                    }
-                                    let _ = store.upsert_scheduler_state(name, false).await;
-                                }
-                                {
-                                    let mut logs_guard = logs.lock().await;
-                                    let entry = logs_guard
-                                        .entry(name.clone())
-                                        .or_insert_with(VecDeque::new);
-                                    entry.push_front(PipeRunLog {
-                                        pipe_name: name.clone(),
-                                        started_at: skipped_at,
-                                        finished_at: skipped_at,
-                                        success: false,
-                                        stdout: String::new(),
-                                        stderr: message.clone(),
-                                    });
-                                    if entry.len() > PIPE_LOG_ACTIVE_KEEP_PER_PIPE {
-                                        entry.pop_back();
-                                    }
-                                }
-                                if let Some(ref cb) = on_run_complete {
-                                    cb(
-                                        name,
-                                        execution_id,
-                                        trigger,
-                                        false,
-                                        0.0,
-                                        Some("missing_connections"),
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    }
-
                     // Defense-in-depth: check PID file (survives crashes)
                     if let Some(existing_pid) = read_pid_file(&pipes_dir, name) {
                         if is_process_alive(existing_pid) {
@@ -5659,22 +5665,6 @@ impl PipeManager {
                             );
                             remove_pid_file(&pipes_dir, name);
                         }
-                    }
-
-                    let executor = match executors.get(&config.agent) {
-                        Some(e) => e.clone(),
-                        None => {
-                            warn!("pipe '{}': agent '{}' not registered", name, config.agent);
-                            continue;
-                        }
-                    };
-
-                    if !executor.is_available() {
-                        debug!(
-                            "pipe '{}': agent '{}' not available yet",
-                            name, config.agent
-                        );
-                        continue;
                     }
 
                     info!(
@@ -5741,12 +5731,35 @@ impl PipeManager {
                         qr.insert(name.clone());
                     }
 
-                    // Resolve preset → model/provider overrides (same as run_pipe)
-                    let (model, provider, provider_url, api_key, preset_prompt) = if let Some(
-                        preset_id,
-                    ) =
-                        config.preset.first()
-                    {
+                    // Resolve runner configuration using the same path as manual runs.
+                    let (
+                        model,
+                        provider,
+                        provider_url,
+                        api_key,
+                        preset_prompt,
+                        run_agent,
+                        executor_config,
+                    ) = if config.agent == "cloud-agent" {
+                        let cloud = match cloud_agent_run_settings(config, body) {
+                            Ok(cloud) => cloud,
+                            Err(error) => {
+                                warn!("scheduler: pipe '{}': {error}", name);
+                                let mut qr = queued_or_running.lock().await;
+                                qr.remove(name);
+                                continue;
+                            }
+                        };
+                        (
+                            cloud.model,
+                            Some(cloud.provider),
+                            None,
+                            None,
+                            None,
+                            "cloud-agent".to_string(),
+                            Some(cloud.executor_config),
+                        )
+                    } else if let Some(preset_id) = config.preset.first() {
                         match resolve_preset(&pipes_dir, preset_id) {
                             Some(resolved) => {
                                 info!("scheduler: pipe '{}' using preset '{}' → model={}, provider={:?}",
@@ -5757,6 +5770,8 @@ impl PipeManager {
                                     resolved.url,
                                     resolved.api_key,
                                     resolved.prompt,
+                                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                                    resolved.executor_config,
                                 )
                             }
                             None if is_enterprise_managed(config) => {
@@ -5845,6 +5860,8 @@ impl PipeManager {
                                 None,
                                 None,
                                 None,
+                                config.agent.clone(),
+                                None,
                             ),
                         }
                     } else {
@@ -5863,6 +5880,8 @@ impl PipeManager {
                                     resolved.url,
                                     resolved.api_key,
                                     resolved.prompt,
+                                    resolved.executor.unwrap_or_else(|| config.agent.clone()),
+                                    resolved.executor_config,
                                 )
                             }
                             None => (
@@ -5871,13 +5890,29 @@ impl PipeManager {
                                 None,
                                 None,
                                 None,
+                                config.agent.clone(),
+                                None,
                             ),
+                        }
+                    };
+
+                    let executor = match executors.get(&run_agent) {
+                        Some(executor) if executor.is_available() => executor.clone(),
+                        Some(_) => {
+                            warn!("pipe '{}': agent '{}' not available yet", name, run_agent);
+                            queued_or_running.lock().await.remove(name);
+                            continue;
+                        }
+                        None => {
+                            warn!("pipe '{}': agent '{}' not registered", name, run_agent);
+                            queued_or_running.lock().await.remove(name);
+                            continue;
                         }
                     };
 
                     // Pre-configure pi with the pipe's provider
                     let mut pipe_token: Option<String> = None;
-                    if config.agent == "pi" {
+                    if run_agent == "pi" {
                         let cloud_token = executor.user_token();
                         if let Err(e) = PiExecutor::ensure_pi_config(
                             cloud_token.as_deref(),
@@ -5890,7 +5925,8 @@ impl PipeManager {
                         {
                             warn!("scheduler: failed to pre-configure pi provider: {}", e);
                         }
-
+                    }
+                    if matches!(run_agent.as_str(), "pi" | "acp") {
                         pipe_token = setup_pipe_permissions(
                             &pipes_dir.join(name),
                             config,
@@ -5910,7 +5946,7 @@ impl PipeManager {
                         preset_prompt.as_deref(),
                         connections_context.as_deref(),
                         local_api_key.as_deref(),
-                        config.agent == "pi" && pi_package_enabled("pi-subagents"),
+                        run_agent == "pi" && pi_package_enabled("pi-subagents"),
                     );
                     // Resolve this run's own context (Live View targets it owns)
                     // and append it to the shared context, exactly as the
@@ -6144,6 +6180,7 @@ impl PipeManager {
                                 // Owner tag — must match pipeSessionId() on the
                                 // frontend. See run_pipe_with_trigger.
                                 Some(session_owner.as_str()),
+                                executor_config.as_ref(),
                             ),
                         )
                         .await;
@@ -6757,6 +6794,7 @@ pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
         "agent",
         "model",
         "provider",
+        "cloud_agent",
         "preset",
         "connections",
         "permissions",
@@ -8085,6 +8123,43 @@ mod tests {
     use chrono::{TimeZone, Timelike};
     use std::sync::atomic::Ordering;
 
+    #[test]
+    fn cloud_scheduler_settings_preserve_task_and_provider_for_every_runner() {
+        for provider in ["codex", "claude", "cursor"] {
+            let source = format!(
+                "---\nschedule: daily\ncloud_agent:\n  provider: {provider}\n  send_screenpipe_context: false\n---\nSummarize my day"
+            );
+            let (config, task) = parse_frontmatter(&source).unwrap();
+            let settings = cloud_agent_run_settings(&config, &task).unwrap();
+
+            assert_eq!(settings.provider, provider);
+            assert_eq!(settings.model, "provider-default");
+            assert_eq!(settings.executor_config["task_instructions"], task);
+            assert_eq!(
+                settings.executor_config["cloud_agent"]["provider"],
+                provider
+            );
+            assert_eq!(
+                settings.executor_config["cloud_agent"]["send_screenpipe_context"],
+                false
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_scheduler_rejects_missing_runner_configuration() {
+        let (config, task) =
+            parse_frontmatter("---\nschedule: daily\n---\nSummarize my day").unwrap();
+
+        assert_eq!(
+            cloud_agent_run_settings(&config, &task)
+                .err()
+                .unwrap()
+                .to_string(),
+            "cloud_agent config is missing"
+        );
+    }
+
     // -- scheduler lifecycle tests ------------------------------------------
 
     /// Helper: create a minimal PipeManager for testing (no executors, no store).
@@ -9056,7 +9131,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_presets_are_not_exposed_to_raw_pi_pipes() {
+    fn explicit_acp_presets_resolve_without_changing_the_legacy_default() {
         let temp = tempfile::tempdir().unwrap();
         let pipes_dir = temp.path().join("pipes");
         std::fs::create_dir_all(&pipes_dir).unwrap();
@@ -9069,6 +9144,10 @@ mod tests {
                             "id": "coding-agent",
                             "provider": "acp",
                             "model": "codex-acp",
+                            "acpAgent": {
+                                "id": "codex-acp",
+                                "config": { "model": "gpt-5.6-codex" }
+                            },
                             "defaultPreset": true
                         },
                         {
@@ -9087,10 +9166,17 @@ mod tests {
         let default = resolve_preset(&pipes_dir, "default").expect("raw Pi default fallback");
         assert_eq!(default.provider.as_deref(), Some("screenpipe"));
         assert_eq!(default.model, "auto");
-        assert!(resolve_preset(&pipes_dir, "coding-agent").is_none());
+        let acp = resolve_preset(&pipes_dir, "coding-agent").expect("explicit ACP preset");
+        assert_eq!(acp.provider.as_deref(), Some("acp"));
+        assert_eq!(acp.executor.as_deref(), Some("acp"));
+        assert_eq!(acp.model, "gpt-5.6-codex");
+        assert_eq!(acp.executor_config.as_ref().unwrap()["id"], "codex-acp");
         let raw = resolve_preset(&pipes_dir, "raw-pi").expect("raw Pi preset");
         assert_eq!(raw.provider.as_deref(), Some("screenpipe"));
-        assert_eq!(list_available_preset_ids(&pipes_dir), vec!["raw-pi"]);
+        assert_eq!(
+            list_available_preset_ids(&pipes_dir),
+            vec!["coding-agent", "raw-pi"]
+        );
     }
 
     #[test]
@@ -9501,6 +9587,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec!["default".to_string()],
             permissions: PipePermissionsConfig::default(),
@@ -10237,6 +10324,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec!["default".to_string()],
             permissions: PipePermissionsConfig::default(),
@@ -10397,6 +10485,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10436,6 +10525,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10465,6 +10555,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10503,6 +10594,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
+            cloud_agent: None,
             effort: PipeEffort::Low,
             preset: vec![],
             permissions: PipePermissionsConfig::default(),
@@ -10629,6 +10721,7 @@ mod tests {
                 agent: "pi".to_string(),
                 model: "test".to_string(),
                 provider: None,
+                cloud_agent: None,
                 effort: PipeEffort::Low,
                 preset: vec![],
                 permissions: PipePermissionsConfig::default(),

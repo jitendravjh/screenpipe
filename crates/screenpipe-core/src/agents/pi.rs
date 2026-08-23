@@ -28,6 +28,7 @@ const PI_INSTALL_ARGS: [&str; 5] = [
     "@anthropic-ai/sdk",
 ];
 const CUSTOM_PROVIDER_USER_AGENT: &str = "screenpipe";
+const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 
 /// Apply compatibility settings required by OpenAI-compatible custom endpoints.
@@ -42,9 +43,18 @@ const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// origin both serve non-API routes at `/`. Older presets commonly saved one of
 /// those bare origins; repair only those proven aliases instead of guessing that
 /// every custom provider uses `/v1`.
+///
+/// Google's Gemini OpenAI-compatible endpoint rejects the optional `store`
+/// request field. Pi otherwise sends `store: false` for standard-compatible
+/// providers, so disable that capability on each Gemini model while preserving
+/// any other explicit compatibility overrides.
 pub fn apply_custom_provider_compat(provider: &mut serde_json::Value) {
-    if let Some(base_url) = provider.get_mut("baseUrl").and_then(|value| value.as_str()) {
-        let trimmed = base_url.trim().trim_end_matches('/');
+    let normalized_base_url = provider
+        .get("baseUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(|base_url| base_url.trim().trim_end_matches('/').to_string());
+
+    if let Some(trimmed) = normalized_base_url.as_deref() {
         if trimmed.eq_ignore_ascii_case("https://ai.ai-genesis.app")
             || trimmed.eq_ignore_ascii_case("https://api.ai-genesis.app")
         {
@@ -69,6 +79,35 @@ pub fn apply_custom_provider_compat(provider: &mut serde_json::Value) {
         .any(|header| header.eq_ignore_ascii_case("user-agent"))
     {
         headers.insert("User-Agent".to_string(), json!(CUSTOM_PROVIDER_USER_AGENT));
+    }
+
+    let is_gemini_openai = normalized_base_url
+        .as_deref()
+        .is_some_and(|base_url| base_url.eq_ignore_ascii_case(GEMINI_OPENAI_BASE_URL));
+    if !is_gemini_openai {
+        return;
+    }
+
+    let Some(models) = provider_object
+        .get_mut("models")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for model in models {
+        let Some(model_object) = model.as_object_mut() else {
+            continue;
+        };
+        let compat = model_object
+            .entry("compat".to_string())
+            .or_insert_with(|| json!({}));
+        if !compat.is_object() {
+            *compat = json!({});
+        }
+        compat
+            .as_object_mut()
+            .expect("custom provider model compat was initialized as an object")
+            .insert("supportsStore".to_string(), json!(false));
     }
 }
 
@@ -742,6 +781,10 @@ impl PiExecutor {
                 include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
             ),
             (
+                "screenpipe-chats",
+                include_str!("../../assets/skills/screenpipe-chats/SKILL.md"),
+            ),
+            (
                 "render-html-report",
                 include_str!("../../assets/skills/render-html-report/SKILL.md"),
             ),
@@ -810,9 +853,10 @@ impl PiExecutor {
     /// [`Self::USER_SKILL_MARKER`], be deleted by a later sync. The desktop
     /// importer already rejects these names; this guards any folder that reaches
     /// the store another way.
-    const BASELINE_SKILL_NAMES: [&'static str; 4] = [
+    const BASELINE_SKILL_NAMES: [&'static str; 5] = [
         "screenpipe-api",
         "screenpipe-cli",
+        "screenpipe-chats",
         "screenpipe-team",
         "render-html-report",
     ];
@@ -952,6 +996,11 @@ impl PiExecutor {
                 Box::new(|_| true), // always installed — pipe & connection management
             ),
             (
+                "screenpipe-chats",
+                include_str!("../../assets/skills/screenpipe-chats/SKILL.md"),
+                Box::new(|_| true), // search is read-only; unattended delivery is tool-gated
+            ),
+            (
                 "render-html-report",
                 include_str!("../../assets/skills/render-html-report/SKILL.md"),
                 // Output-formatting skill, not endpoint-gated — always staged,
@@ -1019,6 +1068,32 @@ impl PiExecutor {
         let ext_path = ext_dir.join("orphan-guard.ts");
         std::fs::write(&ext_path, ext_content)?;
         debug!("orphan-guard extension installed at {:?}", ext_path);
+        Ok(())
+    }
+
+    /// Install the shared self-improvement extension for native Pi sessions.
+    /// It exposes the same profile and skill-management contract ACP agents
+    /// receive from the bundled screenpipe-tools MCP server.
+    pub fn ensure_self_improvement_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(&ext_dir)?;
+        let ext_content = include_str!("../../assets/extensions/self-improvement.ts");
+        let ext_path = ext_dir.join("self-improvement.ts");
+        std::fs::write(&ext_path, ext_content)?;
+        debug!("self-improvement extension installed at {:?}", ext_path);
+        Ok(())
+    }
+
+    /// Install inter-chat discovery and delivery for an interactive chat.
+    /// Pipe executors do not call this: cross-chat sends are intentionally a
+    /// user-facing chat capability, not ambient automation authority.
+    pub fn ensure_chat_control_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(&ext_dir)?;
+        let ext_content = include_str!("../../assets/extensions/chat-control.ts");
+        let ext_path = ext_dir.join("chat-control.ts");
+        std::fs::write(&ext_path, ext_content)?;
+        debug!("chat-control extension installed at {:?}", ext_path);
         Ok(())
     }
 
@@ -1996,6 +2071,7 @@ impl AgentExecutor for PiExecutor {
         )?;
         Self::ensure_context_pruning_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
+        Self::ensure_self_improvement_extension(working_dir)?;
         Self::ensure_mcp_bridge_extension(working_dir)?;
         Self::ensure_register_artifact_extension(working_dir)?;
         Self::ensure_structured_output_extension(working_dir)?;
@@ -2080,6 +2156,7 @@ impl AgentExecutor for PiExecutor {
         pipe_system_prompt: Option<&str>,
         mcp_server_allowlist: Option<&[String]>,
         session_owner: Option<&str>,
+        _executor_config: Option<&serde_json::Value>,
     ) -> Result<AgentOutput> {
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
         let (resolved_model, fell_back_from) = self
@@ -2116,6 +2193,7 @@ impl AgentExecutor for PiExecutor {
         )?;
         Self::ensure_context_pruning_extension(working_dir)?;
         Self::ensure_orphan_guard_extension(working_dir)?;
+        Self::ensure_self_improvement_extension(working_dir)?;
         Self::ensure_mcp_bridge_extension(working_dir)?;
         Self::ensure_register_artifact_extension(working_dir)?;
         Self::ensure_structured_output_extension(working_dir)?;
@@ -4130,6 +4208,56 @@ mod tests {
         assert!(content.contains("do not replace it with zero or a no-data state"));
     }
 
+    #[test]
+    fn self_improvement_extension_installs_profile_and_skill_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        PiExecutor::ensure_self_improvement_extension(dir.path())
+            .expect("install self-improvement extension");
+
+        let content = std::fs::read_to_string(
+            dir.path()
+                .join(".pi")
+                .join("extensions")
+                .join("self-improvement.ts"),
+        )
+        .expect("read self-improvement extension");
+        assert!(content.contains("name: \"user_profile\""));
+        assert!(content.contains("name: \"skill_manage\""));
+        assert!(content.contains("/agent/skills/manage"));
+    }
+
+    #[test]
+    fn chat_control_extension_installs_guarded_search_and_send_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        PiExecutor::ensure_chat_control_extension(dir.path())
+            .expect("install chat-control extension");
+        PiExecutor::ensure_screenpipe_skill(dir.path()).expect("install screenpipe skills");
+
+        let content = std::fs::read_to_string(
+            dir.path()
+                .join(".pi")
+                .join("extensions")
+                .join("chat-control.ts"),
+        )
+        .expect("read chat-control extension");
+        assert!(content.contains("name: \"search_chats\""));
+        assert!(content.contains("name: \"send_to_chat\""));
+        assert!(content.contains("confirmed=true"));
+        assert!(content.contains("SCREENPIPE_CHAT_CONTROL_ADDR"));
+        assert!(!content.contains("/agent/chats/"));
+
+        let skill = std::fs::read_to_string(
+            dir.path()
+                .join(".pi")
+                .join("skills")
+                .join("screenpipe-chats")
+                .join("SKILL.md"),
+        )
+        .expect("read screenpipe-chats skill");
+        assert!(skill.contains("Call `search_chats`"));
+        assert!(skill.contains("explicit user authorization"));
+    }
+
     #[cfg(windows)]
     fn windows_process_is_running(pid: u32) -> bool {
         use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
@@ -5181,10 +5309,34 @@ mod tests {
     }
 
     #[test]
+    fn custom_provider_compat_disables_store_for_gemini_openai_endpoint() {
+        let mut provider = json!({
+            "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "models": [
+                {
+                    "id": "gemini-3.1-flash-lite",
+                    "compat": {"maxTokensField": "max_tokens"}
+                },
+                {"id": "gemini-3.6-flash"}
+            ]
+        });
+        apply_custom_provider_compat(&mut provider);
+
+        assert_eq!(provider["models"][0]["compat"]["supportsStore"], false);
+        assert_eq!(
+            provider["models"][0]["compat"]["maxTokensField"],
+            "max_tokens"
+        );
+        assert_eq!(provider["models"][1]["compat"]["supportsStore"], false);
+        assert_eq!(provider["headers"]["User-Agent"], "screenpipe");
+    }
+
+    #[test]
     fn custom_provider_compat_preserves_generic_urls_and_explicit_user_agents() {
         let mut provider = json!({
             "baseUrl": "https://proxy.example.com/openai/",
-            "headers": {"user-agent": "my-client", "x-tenant": "tenant-1"}
+            "headers": {"user-agent": "my-client", "x-tenant": "tenant-1"},
+            "models": [{"id": "my-model"}]
         });
         apply_custom_provider_compat(&mut provider);
 
@@ -5192,6 +5344,7 @@ mod tests {
         assert_eq!(provider["headers"]["user-agent"], "my-client");
         assert_eq!(provider["headers"]["x-tenant"], "tenant-1");
         assert_eq!(provider["headers"].as_object().unwrap().len(), 2);
+        assert!(provider["models"][0].get("compat").is_none());
     }
 
     #[tokio::test]
