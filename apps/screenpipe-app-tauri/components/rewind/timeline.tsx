@@ -115,6 +115,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 		locallyRestrictedHistory,
 	);
 	const { health } = useHealthCheck();
+	const screenshotsDisabledState = screenshotsDisabledCta(health);
 	const [currentIndex, setCurrentIndex] = useState(0);
 	const [showAudioTranscript, setShowAudioTranscript] = useState(false);
 	const [showSearchModal, setShowSearchModal] = useState(false);
@@ -1319,7 +1320,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 										Open settings
 									</button>
 								</div>
-							) : screenshotsDisabledCta(health) ? (
+							) : screenshotsDisabledState ? (
 								<div className="text-center p-8 max-w-md">
 									<div className="mx-auto mb-8 w-24 h-24 flex items-center justify-center">
 										<div className="w-16 h-16 rounded-full bg-muted/50 border border-border flex items-center justify-center">
@@ -1328,10 +1329,10 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 									</div>
 
 									<h3 className="text-xl font-semibold text-foreground mb-3">
-										{screenshotsDisabledCta(health)?.headline}
+										{screenshotsDisabledState.headline}
 									</h3>
 									<p className="text-muted-foreground mb-6 leading-relaxed">
-										{screenshotsDisabledCta(health)?.body}
+										{screenshotsDisabledState.body}
 									</p>
 
 									<button
@@ -1712,6 +1713,11 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 									<div className="text-center text-muted-foreground flex items-center justify-center gap-2">
 										<MonitorOff className="w-3.5 h-3.5" />
 										Screen recording is off — no timeline to show
+									</div>
+								) : screenshotsDisabledState ? (
+									<div className="text-center text-muted-foreground flex items-center justify-center gap-2">
+										<MonitorOff className="w-3.5 h-3.5" />
+										New screenshots are paused
 									</div>
 								) : (
 									<div className="text-center text-muted-foreground flex items-center justify-center gap-2">
