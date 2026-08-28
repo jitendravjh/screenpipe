@@ -445,7 +445,7 @@ describe("Timeline empty state (mounted)", () => {
 
 		expect(screen.getByTestId("frame-canvas")).toBeInTheDocument();
 		expect(
-			screen.queryByRole("heading", { name: /new screenshots are turned off/i }),
+			screen.queryByRole("heading", { name: /screenshots are turned off/i }),
 		).toBeNull();
 	});
 });

@@ -50,13 +50,13 @@ export function screenshotsDisabledCta(
 	switch (health?.vision_reason) {
 		case "screenshots_disabled_by_config":
 			return {
-				headline: "New screenshots are turned off",
-				body: "Screenpipe is still capturing text, and your previously recorded timeline remains available. Turn screenshots back on in settings to capture new images.",
+				headline: "Screenshots are turned off",
+				body: "Screenpipe is still capturing text, but screenshots are disabled in settings. Turn them back on to see your timeline.",
 			};
 		case "screenshots_disabled_by_power_profile":
 			return {
-				headline: "Battery saver paused new screenshots",
-				body: "Your previously recorded timeline remains available. Change the power mode in settings to resume capturing new images.",
+				headline: "Battery saver paused screenshots",
+				body: "Screenpipe stopped taking screenshots to save power. Change the power mode in settings to resume them.",
 			};
 		default:
 			return null;

@@ -15,15 +15,13 @@ describe("isScreenRecordingOff", () => {
 
 describe("screenshotsDisabledCta", () => {
 	it("names the config and power-profile screenshot-disable states", () => {
-		for (const reason of [
-			"screenshots_disabled_by_config",
-			"screenshots_disabled_by_power_profile",
-		]) {
-			const cta = screenshotsDisabledCta({ vision_reason: reason });
-			expect(cta?.headline.toLowerCase()).toContain("new screenshots");
-			expect(cta?.body).toContain("previously recorded timeline remains available");
-			expect(cta?.body).toContain("new images");
-		}
+		expect(
+			screenshotsDisabledCta({ vision_reason: "screenshots_disabled_by_config" })?.headline,
+		).toContain("Screenshots are turned off");
+		expect(
+			screenshotsDisabledCta({ vision_reason: "screenshots_disabled_by_power_profile" })
+				?.headline,
+		).toContain("Battery saver");
 	});
 
 	it("never fires for permission, stall, healthy, or missing health", () => {
