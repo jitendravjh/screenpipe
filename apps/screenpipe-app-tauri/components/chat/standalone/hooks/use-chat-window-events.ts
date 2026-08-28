@@ -17,7 +17,10 @@ import type { ContentBlock, Message, OptimisticSteerPayload } from "@/lib/chat/t
 import { normalizeImageDataUrls } from "@/lib/chat/image-content";
 import type { ChatConversation } from "@/lib/hooks/use-settings";
 import type { AIPreset } from "@/lib/utils/tauri";
-import { useChatStore } from "@/lib/stores/chat-store";
+import {
+  isEphemeralSideConversation,
+  useChatStore,
+} from "@/lib/stores/chat-store";
 import { useChatPrefillEvents } from "@/components/chat/standalone/hooks/use-chat-prefill-events";
 
 type SendMessageRef = React.MutableRefObject<
@@ -101,6 +104,11 @@ interface UseChatPrefillListenerOptions {
   setIsStreaming: React.Dispatch<React.SetStateAction<boolean>>;
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setConversationId: React.Dispatch<React.SetStateAction<string | null>>;
+  openFilePreview: (
+    path: string,
+    previousMode?: "browser" | "hidden",
+    targetConversationId?: string | null,
+  ) => void;
 }
 
 export function useChatPrefillListener({
@@ -124,6 +132,7 @@ export function useChatPrefillListener({
   setIsStreaming,
   setMessages,
   setConversationId,
+  openFilePreview,
 }: UseChatPrefillListenerOptions) {
   const prefillInFlightRef = useRef(false);
   const { claimPrefillHandling } = useChatPrefillEvents();
@@ -138,8 +147,19 @@ export function useChatPrefillListener({
       autoSend?: boolean;
       source?: string;
       targetWindow?: string;
+      filePreviewPath?: string;
     }>("chat-prefill", (event) => {
-      const { context, prompt, displayLabel, frameId, images, autoSend, source, targetWindow } = event.payload;
+      const {
+        context,
+        prompt,
+        displayLabel,
+        frameId,
+        images,
+        autoSend,
+        source,
+        targetWindow,
+        filePreviewPath,
+      } = event.payload;
       const prefillImages = normalizeImageDataUrls(images);
 
       if (!shouldHandleChatPrefillForWindow({ targetWindow, autoSend }, getCurrentWindow().label)) return;
@@ -215,6 +235,9 @@ export function useChatPrefillListener({
       if (prompt) {
         setInput(prompt);
       }
+      if (filePreviewPath) {
+        openFilePreview(filePreviewPath, "hidden");
+      }
       setTimeout(() => inputRef.current?.focus(), 100);
     });
 
@@ -266,7 +289,10 @@ export function useChatConversationRoutingEvents({
     }
 
     const session = useChatStore.getState().sessions[convId];
-    if (session?.messages && session.messages.length > 0) {
+    if (
+      isEphemeralSideConversation(session) ||
+      (session?.messages && session.messages.length > 0)
+    ) {
       loadConversationRef.current({
         id: convId,
         title: session.title || "untitled",
@@ -323,6 +349,7 @@ export function useChatConversationRoutingEvents({
 }
 
 interface UseChatE2EGlobalsOptions {
+  openFilePreview: (path: string) => void;
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   setConversationId: React.Dispatch<React.SetStateAction<string | null>>;
   piSessionIdRef: React.MutableRefObject<string>;
@@ -330,13 +357,16 @@ interface UseChatE2EGlobalsOptions {
   piStreamingTextRef: React.MutableRefObject<string>;
   piMessageIdRef: React.MutableRefObject<string | null>;
   piContentBlocksRef: React.MutableRefObject<ContentBlock[]>;
+  piStartInFlightRef: React.MutableRefObject<boolean>;
   forceQueueModeRef: React.MutableRefObject<boolean>;
   sendDispatchInFlightRef: React.MutableRefObject<boolean>;
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
   setIsStreaming: React.Dispatch<React.SetStateAction<boolean>>;
+  setPiStarting: React.Dispatch<React.SetStateAction<boolean>>;
 }
 
 export function useChatE2EGlobals({
+  openFilePreview,
   setMessages,
   setConversationId,
   piSessionIdRef,
@@ -344,10 +374,12 @@ export function useChatE2EGlobals({
   piStreamingTextRef,
   piMessageIdRef,
   piContentBlocksRef,
+  piStartInFlightRef,
   forceQueueModeRef,
   sendDispatchInFlightRef,
   setIsLoading,
   setIsStreaming,
+  setPiStarting,
 }: UseChatE2EGlobalsOptions) {
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -479,6 +511,12 @@ export function useChatE2EGlobals({
     };
 
     (window as unknown as {
+      __e2eOpenFilePreview?: (path: string) => void;
+    }).__e2eOpenFilePreview = (path: string) => {
+      openFilePreview(path);
+    };
+
+    (window as unknown as {
       __e2eReadActiveTurn?: () => {
         sessionId: string;
         assistantMessageId: string | null;
@@ -557,23 +595,38 @@ export function useChatE2EGlobals({
       void emit("chat-current-session", { id: sid });
     };
 
+    // Hold/release the same readiness gate owned by real background starts.
+    // Visual E2E uses this to keep the handshake pending long enough to prove
+    // the composer remains editable and an early send waits without dispatch.
+    (window as unknown as {
+      __e2eSetPiStartInFlight?: (inFlight: boolean) => void;
+    }).__e2eSetPiStartInFlight = (inFlight: boolean) => {
+      piStartInFlightRef.current = inFlight;
+      setPiStarting(inFlight);
+    };
+
     return () => {
       delete (window as unknown as { __e2eSeedUserMessage?: unknown }).__e2eSeedUserMessage;
       delete (window as unknown as { __e2eSeedAssistantMessage?: unknown }).__e2eSeedAssistantMessage;
+      delete (window as unknown as { __e2eOpenFilePreview?: unknown }).__e2eOpenFilePreview;
       delete (window as unknown as { __e2eReadActiveTurn?: unknown }).__e2eReadActiveTurn;
       delete (window as unknown as { __e2eLatchActiveSend?: unknown }).__e2eLatchActiveSend;
       delete (window as unknown as { __e2eLatchPreflightSend?: unknown }).__e2eLatchPreflightSend;
+      delete (window as unknown as { __e2eSetPiStartInFlight?: unknown }).__e2eSetPiStartInFlight;
     };
   }, [
     forceQueueModeRef,
+    openFilePreview,
     sendDispatchInFlightRef,
     piContentBlocksRef,
     piMessageIdRef,
     piSessionIdRef,
     piSessionSyncedRef,
+    piStartInFlightRef,
     piStreamingTextRef,
     setConversationId,
     setIsLoading,
+    setPiStarting,
     setIsStreaming,
     setMessages,
   ]);

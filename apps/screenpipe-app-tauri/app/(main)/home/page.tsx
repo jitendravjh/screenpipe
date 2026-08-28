@@ -48,7 +48,10 @@ import {
   isSidebarNavLayoutDefault,
   type SidebarNavId,
 } from "@/lib/utils/sidebar-nav-layout";
-import { SidebarNavList } from "@/components/sidebar-nav-list";
+import {
+  SidebarCustomizationMenu,
+  SidebarNavList,
+} from "@/components/sidebar-nav-list";
 import { CommandPalette } from "@/components/command-palette";
 import { useToast } from "@/components/ui/use-toast";
 import { ToastAction } from "@/components/ui/toast";
@@ -72,6 +75,7 @@ import Timeline from "@/components/rewind/timeline";
 import {
   NativeTimeline,
   NativeTimelineBridge,
+  shouldClearActivityReturn,
 } from "@/components/rewind/native-timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
@@ -110,6 +114,15 @@ import { PlanExpirationNotice } from "@/components/plan-expiration-notice";
 import type { AppUser } from "@/lib/app-entitlement";
 import { ONBOARDING_BRAIN_HANDOFF_EVENT } from "@/lib/live-views/onboarding-activation";
 import { ActivityLedger } from "@/components/activity-ledger";
+import { ShortcutKeycap } from "@/components/shortcut-keycap";
+import { ExperimentalShortcutGuide } from "@/components/shortcut-guide";
+import { commandPalette as commandPaletteAnalytics } from "@/lib/analytics/command-palette";
+import { useExperimentalFeaturesEnabled } from "@/lib/experimental-features";
+import {
+  dispatchChatShortcutAction,
+  inAppShortcutLabel,
+  matchesInAppShortcut,
+} from "@/lib/shortcuts";
 
 type MainSection = "home" | "timeline" | "activity" | "brain" | "pipes" | "connections" | "meetings" | "help";
 type ConnectionFocusRequest = {
@@ -137,12 +150,19 @@ const isSettingsRoute = (value: string) => resolveSettingsSection(value) !== nul
 function HomeContent() {
   const router = useRouter();
   const { isMac } = usePlatform();
+  const experimentalFeaturesEnabled = useExperimentalFeaturesEnabled();
+  const [shortcutGuideOpen, setShortcutGuideOpen] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   // In fullscreen, macOS hides the traffic lights — collapse the
   // reservation that keeps the top-left action icons clear of them.
   const isFullscreen = useIsFullscreen();
   const reserveTrafficLights = isMac && !isFullscreen;
   const [activeSection, setActiveSection] = useQueryState("section", {
     defaultValue: "home",
+    // Sidebar sections are navigation, not disposable filter state. Keeping
+    // each user-visible section in browser history lets the native trackpad
+    // gesture preview and restore the UI the user actually came from.
+    history: "push",
     parse: (value) => {
       if (value === "feedback") return "help"; // backwards compat
       if (value === "memories") return "brain"; // backwards compat — renamed to brain
@@ -154,32 +174,21 @@ function HomeContent() {
     serialize: (value) => value,
   });
   const [activityReturnVisible, setActivityReturnVisible] = useState(false);
-  const activityReturnButtonRef = useRef<HTMLButtonElement | null>(null);
+  const previousSectionRef = useRef(activeSection);
   const returnToActivity = useCallback(() => {
     setActivityReturnVisible(false);
     router.push("/home?section=activity");
   }, [router]);
-  const dismissActivityReturn = useCallback(() => {
-    setActivityReturnVisible(false);
-  }, []);
 
   useEffect(() => {
+    const previousSection = previousSectionRef.current;
+    previousSectionRef.current = activeSection;
     if (
-      !activityReturnVisible ||
-      (activeSection !== "meetings" && activeSection !== "timeline")
+      activityReturnVisible &&
+      shouldClearActivityReturn(previousSection, activeSection)
     ) {
-      return;
-    }
-    const dismiss = (event: PointerEvent) => {
-      if (
-        activityReturnButtonRef.current?.contains(event.target as Node)
-      ) {
-        return;
-      }
       setActivityReturnVisible(false);
-    };
-    document.addEventListener("pointerdown", dismiss, true);
-    return () => document.removeEventListener("pointerdown", dismiss, true);
+    }
   }, [activeSection, activityReturnVisible]);
   const [connectionFocusRequest, setConnectionFocusRequest] = useState<ConnectionFocusRequest | null>(null);
 
@@ -294,6 +303,7 @@ function HomeContent() {
         pinned: false,
         unread: false,
         draft: true,
+        messages: [],
       });
     }
     store.actions.setCurrent(id);
@@ -312,14 +322,14 @@ function HomeContent() {
   useEffect(() => {
     if (!isSectionHidden(activeSection)) return;
     const fallback = ["home", "timeline", "pipes"].find((s) => !isSectionHidden(s));
-    setActiveSection(fallback ?? "home");
+    setActiveSection(fallback ?? "home", { history: "replace" });
   }, [activeSection, isSectionHidden, setActiveSection]);
 
   // Timeline can be turned off in Display settings. When it is, the nav item is
   // gone, so bounce out of the (now unreachable) timeline section to chat.
   useEffect(() => {
     if ((settings.disableTimeline ?? false) && activeSection === "timeline") {
-      setActiveSection("home");
+      setActiveSection("home", { history: "replace" });
     }
   }, [settings.disableTimeline, activeSection, setActiveSection]);
 
@@ -506,31 +516,52 @@ function HomeContent() {
   // Cmd+B / Ctrl+B to toggle sidebar
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "b") {
-        e.preventDefault();
-        toggleSidebar();
-      }
+      if (!matchesInAppShortcut(e, "toggle_sidebar", isMac)) return;
+      e.preventDefault();
+      toggleSidebar();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [toggleSidebar]);
+  }, [isMac, toggleSidebar]);
 
   // Cmd+N / Ctrl+N to start a new chat (matches the "New chat" sidebar button)
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n") {
-        e.preventDefault();
-        setActiveSection("home");
-        startNewChat();
-        // Focus the chat input. When standalone-chat is already mounted (home→home)
-        // it catches this; when mounting fresh from another section, its on-mount
-        // auto-focus handles it instead.
-        void emit("chat-focus-input", {});
+      if (!matchesInAppShortcut(e, "new_chat", isMac)) return;
+      e.preventDefault();
+      setActiveSection("home");
+      startNewChat();
+      // Focus the chat input. When standalone-chat is already mounted (home→home)
+      // it catches this; when mounting fresh from another section, its on-mount
+      // auto-focus handles it instead.
+      void emit("chat-focus-input", {});
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [isMac, setActiveSection, startNewChat]);
+
+  // Own portal-only shortcut surfaces in the hydrated Home shell. Static
+  // WKWebView exports can otherwise defer a closed dialog subtree long enough
+  // for its first keyboard event to be missed.
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (matchesInAppShortcut(event, "command_menu", isMac)) {
+        event.preventDefault();
+        if (!commandPaletteOpen) commandPaletteAnalytics.opened("keyboard");
+        setCommandPaletteOpen(!commandPaletteOpen);
+        return;
+      }
+      if (
+        experimentalFeaturesEnabled &&
+        matchesInAppShortcut(event, "shortcut_guide", isMac)
+      ) {
+        event.preventDefault();
+        setShortcutGuideOpen((open) => !open);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setActiveSection, startNewChat]);
+  }, [commandPaletteOpen, experimentalFeaturesEnabled, isMac]);
   // Fetch actual recording devices. Audio comes from /audio/device/status so
   // user-paused devices stay visible and can be resumed from the same control.
   interface AudioDeviceStatus {
@@ -1045,8 +1076,8 @@ function HomeContent() {
     meetings: { label: "Meetings", icon: <CalendarClock className="h-3.5 w-3.5" /> },
     timeline: { label: "Timeline", icon: <MonitorPlay className="h-3.5 w-3.5" /> },
     activity: { label: "Activity", icon: <ListTree className="h-3.5 w-3.5" /> },
-    brain: { label: "Brain", icon: <Brain className="h-3.5 w-3.5" /> },
-    pipes: { label: "Scheduled", icon: <TimerReset className="h-3.5 w-3.5" /> },
+    brain: { label: "Library", icon: <Brain className="h-3.5 w-3.5" /> },
+    pipes: { label: "Automations", icon: <TimerReset className="h-3.5 w-3.5" /> },
     connections: { label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
   };
 
@@ -1067,7 +1098,6 @@ function HomeContent() {
   const meetingsInToolbar =
     !meetingsInSidebar && availableSidebarIds.includes("meetings");
 
-  const sidebarCustomizable = Boolean(settings.enableSidebarCustomization);
   const persistSidebarLayout = (next: ReturnType<typeof normalizeSidebarNavLayout>) => {
     void updateSettings({ sidebarNavLayout: next });
   };
@@ -1084,8 +1114,8 @@ function HomeContent() {
       title: `${label} hidden`,
       description:
         id === "meetings"
-          ? "still one click away from the icon next to search."
-          : "find it under Hidden at the bottom of the sidebar.",
+          ? "still one click away from the icon in the top bar."
+          : "use sidebar options in the top bar to bring it back.",
       action: (
         <ToastAction
           altText={`Show ${label} in the sidebar again`}
@@ -1130,7 +1160,7 @@ function HomeContent() {
     if (!section) return;
     const settingsSection = resolveSettingsSection(section);
     if (settingsSection) {
-      router.push(`/settings?section=${settingsSection}`);
+      openSettings(settingsSection);
     } else {
       const mapped = section === "feedback" ? "help" : section;
       if (ALL_SECTIONS.includes(mapped)) {
@@ -1156,9 +1186,10 @@ function HomeContent() {
   // content (portaled into the shell by AppSidebar) and the content column.
   return (
     <>
-      {/* Drag region — always absolute so it works with full-bleed translucent layout */}
-      <div className="absolute top-0 left-0 right-0 h-8 z-10" data-tauri-drag-region />
-
+      <ExperimentalShortcutGuide
+        open={shortcutGuideOpen}
+        onOpenChange={setShortcutGuideOpen}
+      />
       {/* ⌘K command palette — a second door to actions the sidebar, toolbar,
           and global shortcuts already own. Each row prints its shortcut, so
           palette use teaches the direct key. Home window only: the settings
@@ -1166,10 +1197,13 @@ function HomeContent() {
       {/* Routes actions the native timeline window cannot perform itself. */}
       <NativeTimelineBridge
         onReturnToActivity={returnToActivity}
-        onDismissActivityReturn={dismissActivityReturn}
+        onToggleSidebar={toggleSidebar}
       />
 
       <CommandPalette
+        open={commandPaletteOpen}
+        onOpenChange={setCommandPaletteOpen}
+        experimentalFeaturesEnabled={experimentalFeaturesEnabled}
         deps={{
           openSearch: () => {
             void commands.showWindow({ Search: { query: null } });
@@ -1188,10 +1222,24 @@ function HomeContent() {
           resumeRecording: () => {
             void resumeRecording();
           },
+          switchRecentChat: (direction) => {
+            const dispatch = () =>
+              dispatchChatShortcutAction(
+                direction === 1 ? "next_recent_chat" : "previous_recent_chat",
+              );
+            if (activeSection === "home") {
+              dispatch();
+              return;
+            }
+            void setActiveSection("home").then(() =>
+              window.requestAnimationFrame(dispatch),
+            );
+          },
           goToSection: (id) => {
             void setActiveSection(id);
           },
           toggleSidebar,
+          openShortcutGuide: () => setShortcutGuideOpen(true),
           openSettings,
           sections: availableSidebarIds.map((id) => ({
             id,
@@ -1202,14 +1250,14 @@ function HomeContent() {
       />
 
           {/* Sidebar */}
-          <TooltipProvider delayDuration={0}>
+          <TooltipProvider delayDuration={400}>
           {/* Top-left chrome strip — pinned next to the macOS traffic
               lights: sidebar toggle, search, meetings and recording-status dot.
               No wordmark, no header row (Claude / Codex style). When
               the sidebar is collapsed it is hidden entirely and the
               strip floats over the content, reduced to toggle + status
-              dot. The h-8 drag region already keeps the top band free
-              of interactive content, so nothing collides. Fixed
+              dot. The persistent main shell owns dragging in blank parts of
+              this top band and excludes these controls. Fixed
               positioning anchors the strip to the viewport so it isn't
               clipped by AppSidebar's overflow. The notification bell
               lives in the Pipes view header (pipe-store.tsx) since
@@ -1242,11 +1290,16 @@ function HomeContent() {
                 </button>
               </TooltipTrigger>
               <TooltipContent side="bottom" className="text-xs">
-                {sidebarCollapsed ? "expand sidebar" : "collapse sidebar"} <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]" suppressHydrationWarning>{isMac ? "⌘B" : "Ctrl+B"}</kbd>
+                <span className="flex items-center gap-2">
+                  {sidebarCollapsed ? "expand sidebar" : "collapse sidebar"}
+                  <ShortcutKeycap>
+                    {inAppShortcutLabel("toggle_sidebar", isMac)}
+                  </ShortcutKeycap>
+                </span>
               </TooltipContent>
             </Tooltip>
 
-            {!sidebarCollapsed && (
+            {!sidebarCollapsed && experimentalFeaturesEnabled && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
@@ -1264,15 +1317,39 @@ function HomeContent() {
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="text-xs">
-                  search
-                  {!settings.disabledShortcuts.includes("searchShortcut") &&
-                  settings.searchShortcut ? (
-                    <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
+                  <span className="flex items-center gap-2">
+                    search
+                    {!settings.disabledShortcuts.includes("searchShortcut") &&
+                    settings.searchShortcut ? (
+                    <ShortcutKeycap>
                       {formatShortcutDisplay(settings.searchShortcut, isMac)}
-                    </kbd>
-                  ) : null}
+                    </ShortcutKeycap>
+                    ) : null}
+                  </span>
                 </TooltipContent>
               </Tooltip>
+            )}
+
+            {!sidebarCollapsed && (
+              <SidebarCustomizationMenu
+                hiddenItems={hiddenSidebarIds.map((id) => ({
+                  id,
+                  label: SIDEBAR_SECTION_DEFS[id].label,
+                }))}
+                isTranslucent={isTranslucent}
+                canReset={!isSidebarNavLayoutDefault(sidebarLayout)}
+                onSetHidden={(id, hidden) => {
+                  persistSidebarLayout(
+                    setSidebarNavItemHidden(
+                      sidebarLayout,
+                      availableSidebarIds,
+                      id,
+                      hidden,
+                    ),
+                  );
+                }}
+                onReset={() => persistSidebarLayout(DEFAULT_SIDEBAR_NAV_LAYOUT)}
+              />
             )}
 
             {!sidebarCollapsed && meetingsInToolbar && (
@@ -1323,7 +1400,7 @@ function HomeContent() {
               isTranslucent={isTranslucent}
               floatingOverMedia={sidebarCollapsed && activeSection === "timeline"}
               allCaptureDisabled={!!(settings.disableAudio && settings.disableVision)}
-              onOpenRecordingSettings={() => router.push("/settings?section=recording")}
+              onOpenRecordingSettings={() => openSettings("recording")}
             />
           </div>
 
@@ -1339,17 +1416,12 @@ function HomeContent() {
                 conversation lists. */}
             <div className="pt-2 pr-2 pb-2 flex-1 flex flex-col min-h-0">
               {/* Main sections. Order and visibility are the user's — drag a
-                  row or right-click it (behind the sidebar-customization
-                  rollout gate); enterprise policy still decides eligibility. */}
+                  row or right-click it; enterprise policy still decides
+                  eligibility. */}
               <SidebarNavList
                 items={mainSections}
-                hiddenItems={hiddenSidebarIds.map((id) => ({
-                  id,
-                  label: SIDEBAR_SECTION_DEFS[id].label,
-                }))}
                 activeId={activeSection}
                 isTranslucent={isTranslucent}
-                customizable={sidebarCustomizable}
                 canReset={!isSidebarNavLayoutDefault(sidebarLayout)}
                 onSelect={(id) => {
                   setActiveSection(id);
@@ -1500,6 +1572,7 @@ function HomeContent() {
               <StandaloneChat
                 className="h-full"
                 hideInlineHistory
+                chatShortcutsEnabled={activeSection === "home"}
                 sidebarCollapsed={sidebarCollapsed}
                 firstRunLearningEnabled
               />
@@ -1528,7 +1601,6 @@ function HomeContent() {
             {activityReturnVisible &&
               (activeSection === "meetings" || activeSection === "timeline") && (
                 <button
-                  ref={activityReturnButtonRef}
                   type="button"
                   onClick={returnToActivity}
                   aria-label="back to activity"

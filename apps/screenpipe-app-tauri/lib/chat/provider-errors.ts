@@ -93,12 +93,14 @@ function isConnectionLikeError(errorStr: string): boolean {
     normalized.includes("connection error") ||
     normalized.includes("failed to fetch") ||
     normalized.includes("fetch failed") ||
+    normalized.includes("socket connection was closed unexpectedly") ||
     normalized.includes("econnrefused") ||
     normalized.includes("connection refused") ||
     // network/TLS signatures seen reaching the chat from the gateway, e.g. the
     // 2026-06-18 outage: reqwest "error sending request" / "tls handshake eof".
     normalized.includes("error sending request") ||
     normalized.includes("tls handshake") ||
+    normalized === "error: certificate has expired" ||
     normalized.includes("unexpected eof") ||
     normalized.includes("unexpectedeof") ||
     normalized.includes("could not connect") ||
@@ -369,7 +371,21 @@ export function buildProviderErrorPresentation(
   }
 
   const message = buildGenericProviderErrorMessage(errorStr, preset);
-  return message ? { kind: "provider", message, retryable: true } : null;
+  if (message) return { kind: "provider", message, retryable: true };
+
+  if (
+    isNativeOllamaProvider(preset?.provider) &&
+    errorStr.toLowerCase().includes("does not support tools")
+  ) {
+    const model = preset?.model?.trim() || "the selected model";
+    return {
+      kind: "provider",
+      message: `Ollama model "${model}" does not support tools. Switch your AI preset to an Ollama model that supports tools.`,
+      retryable: false,
+    };
+  }
+
+  return null;
 }
 
 export function buildProviderErrorMessage(

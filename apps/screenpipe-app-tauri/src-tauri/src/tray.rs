@@ -20,8 +20,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::async_runtime::JoinHandle;
-#[cfg(target_os = "macos")]
-use tauri::menu::IconMenuItemBuilder;
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::Emitter;
 use tauri::{
@@ -213,8 +211,8 @@ fn plan_includes_business(plan: Option<&str>) -> bool {
 static UPDATE_MENU_ITEM: Lazy<Mutex<Option<MenuItem<Wry>>>> = Lazy::new(|| Mutex::new(None));
 
 /// The active HD stop item is updated in place for countdown changes. Rebuilding
-/// the entire native menu every five seconds retained macOS preview image backing
-/// stores and caused multi-gigabyte heap growth during long meetings.
+/// the entire native menu every five seconds is wasteful and previously caused
+/// multi-gigabyte heap growth during long meetings.
 static HD_STOP_MENU_ITEM: Lazy<Mutex<Option<MenuItem<Wry>>>> = Lazy::new(|| Mutex::new(None));
 
 // Track last known state to avoid unnecessary updates
@@ -407,6 +405,170 @@ static PENDING_TRAY_MENU: Lazy<Mutex<Option<(MenuState, TrayMenuData)>>> =
 #[cfg(target_os = "macos")]
 static TRAY_MENU_DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// Keep the native status-item menu above Screenpipe's fullscreen-capable
+/// panels. Window mode deliberately lives at level 1001 so it works over a
+/// fullscreen Space; AppKit's popup-menu level is only 101, which otherwise
+/// leaves the tray menu behind the overlay and its attached Timeline child.
+///
+/// This raises only a menu whose delegate is an `NSStatusItem`. The overlay is
+/// never lowered, and ordinary in-app/context menus retain their native level.
+#[cfg(target_os = "macos")]
+mod tray_menu_level {
+    use core_foundation_sys::runloop::{
+        kCFRunLoopBeforeWaiting, kCFRunLoopCommonModes, CFRunLoopActivity, CFRunLoopAddObserver,
+        CFRunLoopGetMain, CFRunLoopObserverContext, CFRunLoopObserverCreate, CFRunLoopObserverRef,
+    };
+    use objc::declare::ClassDecl;
+    use objc::runtime::{Class, Object, Sel};
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::os::raw::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Once;
+    use tauri_nspanel::cocoa::base::{id, nil};
+    use tracing::{debug, error};
+
+    const OVERLAY_LEVEL: i64 = 1001;
+    const TRAY_MENU_LEVEL: i64 = OVERLAY_LEVEL + 1;
+    const NS_POPUP_MENU_LEVEL: i64 = 101;
+
+    static TRAY_MENU_TRACKING: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn notification_belongs_to_status_item(notification: id) -> bool {
+        if notification == nil {
+            return false;
+        }
+        let menu: id = msg_send![notification, object];
+        if menu == nil {
+            return false;
+        }
+        let delegate: id = msg_send![menu, delegate];
+        delegate != nil && msg_send![delegate, isKindOfClass: class!(NSStatusItem)]
+    }
+
+    extern "C" fn menu_did_begin(_this: &Object, _selector: Sel, notification: id) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            if notification_belongs_to_status_item(notification) {
+                TRAY_MENU_TRACKING.store(true, Ordering::Release);
+                // Usually the menu window already exists by this notification.
+                // The common-mode observer below catches the later case.
+                raise_visible_popup_menu_windows();
+            }
+        }));
+    }
+
+    extern "C" fn menu_did_end(_this: &Object, _selector: Sel, notification: id) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            if notification_belongs_to_status_item(notification) {
+                TRAY_MENU_TRACKING.store(false, Ordering::Release);
+            }
+        }));
+    }
+
+    unsafe fn raise_visible_popup_menu_windows() {
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let windows: id = msg_send![app, orderedWindows];
+        if windows == nil {
+            return;
+        }
+        let count: usize = msg_send![windows, count];
+        for index in 0..count {
+            let window: id = msg_send![windows, objectAtIndex: index];
+            let level: i64 = msg_send![window, level];
+            let visible: bool = msg_send![window, isVisible];
+            if visible && level == NS_POPUP_MENU_LEVEL {
+                let _: () = msg_send![window, setLevel: TRAY_MENU_LEVEL];
+                debug!("raised tray menu above Screenpipe overlay");
+            }
+        }
+    }
+
+    extern "C" fn on_menu_tracking_idle(
+        _observer: CFRunLoopObserverRef,
+        _activity: CFRunLoopActivity,
+        _info: *mut c_void,
+    ) {
+        if !TRAY_MENU_TRACKING.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            raise_visible_popup_menu_windows();
+        }));
+    }
+
+    pub fn install() {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| unsafe {
+            let superclass = Class::get("NSObject").expect("NSObject must exist");
+            let observer_class = if let Some(existing) = Class::get("ScreenpipeTrayMenuObserver") {
+                existing
+            } else {
+                let Some(mut declaration) =
+                    ClassDecl::new("ScreenpipeTrayMenuObserver", superclass)
+                else {
+                    error!("failed to declare tray-menu observer");
+                    return;
+                };
+                declaration.add_method(
+                    sel!(trayMenuDidBegin:),
+                    menu_did_begin as extern "C" fn(&Object, Sel, id),
+                );
+                declaration.add_method(
+                    sel!(trayMenuDidEnd:),
+                    menu_did_end as extern "C" fn(&Object, Sel, id),
+                );
+                declaration.register()
+            };
+
+            let notification_observer: id = msg_send![observer_class, new];
+            let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+            let begin_name: id = msg_send![
+                class!(NSString),
+                stringWithUTF8String: b"NSMenuDidBeginTrackingNotification\0".as_ptr()
+            ];
+            let end_name: id = msg_send![
+                class!(NSString),
+                stringWithUTF8String: b"NSMenuDidEndTrackingNotification\0".as_ptr()
+            ];
+            let _: () = msg_send![
+                center,
+                addObserver: notification_observer
+                selector: sel!(trayMenuDidBegin:)
+                name: begin_name
+                object: nil
+            ];
+            let _: () = msg_send![
+                center,
+                addObserver: notification_observer
+                selector: sel!(trayMenuDidEnd:)
+                name: end_name
+                object: nil
+            ];
+
+            let mut context = CFRunLoopObserverContext {
+                version: 0,
+                info: std::ptr::null_mut(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+            let run_loop_observer = CFRunLoopObserverCreate(
+                std::ptr::null(),
+                kCFRunLoopBeforeWaiting,
+                1,
+                0,
+                on_menu_tracking_idle,
+                &mut context,
+            );
+            if run_loop_observer.is_null() {
+                error!("failed to create tray-menu level observer");
+                return;
+            }
+            CFRunLoopAddObserver(CFRunLoopGetMain(), run_loop_observer, kCFRunLoopCommonModes);
+            // Both observers intentionally live for the app lifetime.
+        });
+    }
+}
+
 fn install_tray_menu(tray: &TrayIcon, menu: tauri::menu::Menu<Wry>) -> Result<()> {
     // `ACTIVE_TRAY_MENU` is our record of what Windows/macOS actually owns.
     // Only publish the replacement after the native tray accepted it. If
@@ -484,9 +646,7 @@ fn apply_pending_tray_menu(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// Snapshot current recording/HD/device state into a `MenuState`. Shared by
-/// the periodic refresh loop and the macOS preview-driven rebuild so change
-/// detection can't drift between the two.
+/// Snapshot current recording/HD/device state for the periodic refresh loop.
 fn snapshot_menu_state(data: &TrayMenuData, effective_status: RecordingStatus) -> MenuState {
     let recording_info = get_recording_info();
     let hd = get_high_fps_status();
@@ -557,14 +717,6 @@ fn update_hd_stop_menu_item() {
             debug!("failed to update HD tray countdown in place: {}", e);
         }
     }
-}
-
-/// Rebuild the tray menu after a monitor preview image arrives (macOS only).
-#[cfg(target_os = "macos")]
-pub(crate) fn queue_tray_menu_refresh_for_preview(app: &AppHandle) {
-    let data = prefetch_tray_menu_data(app);
-    let state = snapshot_menu_state(&data, get_effective_recording_status());
-    queue_pending_tray_menu(state, data);
 }
 
 /// Installs the queued tray menu while no menu is open — the only flash-free,
@@ -688,7 +840,7 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
         menu_refresh_observer::install(app);
 
         #[cfg(target_os = "macos")]
-        crate::tray_monitor_preview::install(app);
+        tray_menu_level::install();
 
         // Setup click handlers
         setup_tray_click_handlers(&main_tray)?;
@@ -973,12 +1125,6 @@ fn create_dynamic_menu(
             .filter(|d| d.kind == DeviceKind::Monitor)
             .collect();
         monitors.sort_by(|a, b| a.name.cmp(&b.name));
-        #[cfg(target_os = "macos")]
-        {
-            crate::tray_monitor_preview::clear_registrations();
-            let monitor_ids: Vec<u32> = monitors.iter().filter_map(|d| d.monitor_id).collect();
-            crate::tray_monitor_preview::sync_refresh_monitors(&monitor_ids);
-        }
         for device in monitors {
             let label = format!("  ▣ {}", device.name);
             if let Some(monitor_id) = device.monitor_id {
@@ -988,39 +1134,13 @@ fn create_dynamic_menu(
                     .map(|d| !d.user_disabled)
                     .unwrap_or(device.active);
 
-                #[cfg(target_os = "macos")]
-                {
-                    crate::tray_monitor_preview::register_monitor_submenu(monitor_id, is_active);
-                    crate::tray_monitor_preview::register_preview_item(monitor_id);
-
-                    let preview =
-                        crate::tray_monitor_preview::preview_image_or_placeholder(monitor_id);
-                    let preview_row =
-                        IconMenuItemBuilder::with_id(format!("monitor_preview_{monitor_id}"), " ")
-                            .enabled(false)
-                            .icon(preview)
-                            .build(app)?;
-
-                    let submenu = SubmenuBuilder::with_id(
-                        app,
-                        format!("toggle_vision_device_{monitor_id}"),
-                        label,
-                    )
-                    .item(&preview_row)
-                    .build()?;
-                    menu_builder = menu_builder.item(&submenu);
-                }
-
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let toggle = CheckMenuItemBuilder::with_id(
-                        format!("toggle_vision_device_{}", monitor_id),
-                        label,
-                    )
-                    .checked(is_active)
-                    .build(app)?;
-                    menu_builder = menu_builder.item(&toggle);
-                }
+                let toggle = CheckMenuItemBuilder::with_id(
+                    format!("toggle_vision_device_{}", monitor_id),
+                    label,
+                )
+                .checked(is_active)
+                .build(app)?;
+                menu_builder = menu_builder.item(&toggle);
             } else {
                 let dot = if device.active { "●" } else { "○" };
                 let fallback_label = format!("  {} ▣ {}", dot, device.name);
@@ -1280,6 +1400,88 @@ fn setup_tray_click_handlers(main_tray: &TrayIcon) -> Result<()> {
     Ok(())
 }
 
+/// Return fixed analytics values for actionable tray items. Dynamic native menu
+/// ids can contain monitor ids or audio-device names, so they must never be
+/// forwarded to analytics verbatim.
+fn tray_telemetry_item(menu_id: &str) -> Option<(&'static str, &'static str)> {
+    if menu_id.starts_with("toggle_vision_device_") {
+        return Some(("monitor_toggle", "recording"));
+    }
+    if menu_id.starts_with("toggle_audio_device_") {
+        return Some(("audio_device_toggle", "recording"));
+    }
+
+    match menu_id {
+        "show" => Some(("timeline", "navigation")),
+        "show_search" => Some(("search", "navigation")),
+        "show_chat" => Some(("chat", "navigation")),
+        "open_app" => Some(("open_app", "navigation")),
+        "settings" => Some(("settings", "navigation")),
+        "feedback" => Some(("feedback", "navigation")),
+        "onboarding" => Some(("onboarding", "navigation")),
+        "fix_permissions" | "check_permissions" => Some(("fix_permissions", "navigation")),
+        "start_recording" | "stop_recording" | "toggle_recording" => {
+            Some(("recording_toggle", "recording"))
+        }
+        "pause_5" => Some(("pause_5m", "recording")),
+        "pause_15" => Some(("pause_15m", "recording")),
+        "pause_30" => Some(("pause_30m", "recording")),
+        "pause_60" => Some(("pause_60m", "recording")),
+        "hd_timer_15" => Some(("hd_start_15m", "recording")),
+        "hd_timer_30" => Some(("hd_start_30m", "recording")),
+        "hd_timer_60" => Some(("hd_start_60m", "recording")),
+        "hd_timer_120" => Some(("hd_start_120m", "recording")),
+        "stop_hd_recording" => Some(("hd_stop", "recording")),
+        "extend_hd_30" => Some(("hd_extend_30m", "recording")),
+        "lock_vault" => Some(("lock_vault", "privacy")),
+        "upgrade" => Some(("upgrade", "commercial")),
+        "releases" => Some(("releases", "app")),
+        "update_now" => Some(("update_now", "app")),
+        "book_call" => Some(("book_call", "commercial")),
+        "quit" => Some(("quit", "app")),
+        _ => None,
+    }
+}
+
+fn recording_state_telemetry_value(status: RecordingStatus) -> &'static str {
+    match status {
+        RecordingStatus::Starting => "starting",
+        RecordingStatus::Recording => "recording",
+        RecordingStatus::Paused => "paused",
+        RecordingStatus::ScheduledPause => "scheduled_pause",
+        RecordingStatus::Stopped => "stopped",
+        RecordingStatus::Error => "error",
+    }
+}
+
+/// Track directly from the native handler so clicks are still observed while
+/// headless mode has no mounted webview. Analytics opt-out is enforced by the
+/// shared AnalyticsManager.
+fn track_tray_menu_item_clicked(app: &AppHandle, menu_id: &str) {
+    let Some((item_id, action_group)) = tray_telemetry_item(menu_id) else {
+        return;
+    };
+    let recording_state = recording_state_telemetry_value(get_effective_recording_status());
+
+    if let Some(analytics) = app.try_state::<std::sync::Arc<crate::analytics::AnalyticsManager>>() {
+        let analytics = std::sync::Arc::clone(&analytics);
+        tauri::async_runtime::spawn(async move {
+            let _ = analytics
+                .send_event(
+                    "tray_menu_item_clicked",
+                    Some(serde_json::json!({
+                        "item_id": item_id,
+                        "action_group": action_group,
+                        "recording_state": recording_state,
+                        "source": "tray_menu",
+                        "telemetry_schema_version": 1,
+                    })),
+                )
+                .await;
+        });
+    }
+}
+
 /// Tray menu handler runs inside tao::send_event (Obj-C FFI, nounwind). We must not
 /// do any heavy or panicking work here — defer all window/show/open work to
 /// run_on_main_thread so the sync path is minimal and panic-free.
@@ -1302,6 +1504,8 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
         );
         return;
     }
+
+    track_tray_menu_item_clicked(app_handle, event.id().as_ref());
 
     match event.id().as_ref() {
         "show" => {
@@ -1941,6 +2145,33 @@ mod tests {
             recording_status_text(RecordingStatus::Recording, false, None),
             "● Recording"
         );
+    }
+
+    #[test]
+    fn tray_telemetry_uses_fixed_values_for_dynamic_device_items() {
+        assert_eq!(
+            tray_telemetry_item("toggle_vision_device_42"),
+            Some(("monitor_toggle", "recording"))
+        );
+        assert_eq!(
+            tray_telemetry_item("toggle_audio_device_Private headset (input)"),
+            Some(("audio_device_toggle", "recording"))
+        );
+    }
+
+    #[test]
+    fn tray_telemetry_only_tracks_allowlisted_actions() {
+        assert_eq!(
+            tray_telemetry_item("show_chat"),
+            Some(("chat", "navigation"))
+        );
+        assert_eq!(
+            tray_telemetry_item("pause_30"),
+            Some(("pause_30m", "recording"))
+        );
+        assert_eq!(tray_telemetry_item("monitor_Private display name"), None);
+        assert_eq!(tray_telemetry_item("pause_user_supplied_value"), None);
+        assert_eq!(tray_telemetry_item("future_action"), None);
     }
 
     #[test]

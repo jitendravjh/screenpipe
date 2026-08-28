@@ -379,7 +379,10 @@ impl<R: tauri::Runtime, M: tauri::Manager<R>> GatedWindowPlacement
 /// Keep this as the single post-build entrypoint for window creation callsites.
 pub fn finalize_webview_window(window: tauri::WebviewWindow) -> tauri::WebviewWindow {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    setup_content_process_handler(&window);
+    {
+        setup_content_process_handler(&window);
+        gesture::configure_history_swipe_navigation(&window);
+    }
     if let Err(error) = capture_protection::apply_to_new_window(&window) {
         tracing::warn!("{error}");
     }
@@ -387,6 +390,17 @@ pub fn finalize_webview_window(window: tauri::WebviewWindow) -> tauri::WebviewWi
     // place a non-intrusive e2e run can be kept off the developer's screen.
     sink_below_apps_if_non_intrusive(&window);
     window
+}
+
+/// Apply the frontend's experimental rollout decision to native history swipes.
+/// The platform implementation keeps every non-Home webview forced off.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_history_swipe_navigation_enabled(
+    window: tauri::WebviewWindow,
+    enabled: bool,
+) -> Result<(), String> {
+    gesture::set_history_swipe_navigation_enabled(window, enabled).await
 }
 
 /// Make the live app match the enterprise hidden-UI policy.
@@ -477,6 +491,8 @@ pub(crate) use capture_protection::{native_overlay_is_capturable, overlay_is_cap
 pub use capture_protection::{
     get_app_screen_capture_protection, set_app_screen_capture_protection,
 };
+#[cfg(feature = "e2e")]
+pub(crate) use gesture::history_swipe_navigation_enabled;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use content_process::setup_content_process_handler;

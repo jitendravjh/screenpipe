@@ -14,6 +14,7 @@ import {
   stat,
 } from "@tauri-apps/plugin-fs";
 import type {
+  AgentHarness,
   ChatConversation,
   ConversationKind,
   PipeContext,
@@ -28,6 +29,7 @@ import {
   messagesHaveCompletedReply,
 } from "@/lib/chat-dedup";
 import { mergeConversations } from "@/lib/chat-merge";
+import { isEphemeralSideConversationNamespaceId } from "@/lib/chat/ephemeral-side-conversation";
 
 // Cap on how many (most-recent) conversation files a content search will open
 // and scan. Title matches are cheap over the full ordered list; only the
@@ -225,6 +227,9 @@ async function persistWithMerge(conv: ChatConversation): Promise<void> {
 export async function saveConversationFile(
   conv: ChatConversation
 ): Promise<void> {
+  // Defense in depth: temporary side chats must never reach disk even if a
+  // future caller bypasses the UI/store guards.
+  if (isEphemeralSideConversationNamespaceId(conv.id)) return;
   try {
     await withConversationLock(conv.id, () => persistWithMerge(conv));
   } catch (e) {
@@ -276,6 +281,7 @@ async function writeConversationFile(
 export async function loadConversationFile(
   id: string
 ): Promise<ChatConversation | null> {
+  if (isEphemeralSideConversationNamespaceId(id)) return null;
   const dir = await getChatsDir();
   const filePath = `${dir}/${conversationFilename(id)}`;
   try {
@@ -360,6 +366,13 @@ export interface ConversationMeta {
   /** The AI preset ID last used in this conversation. Used to restore
    *  the model selection when switching between chats. */
   presetId?: string;
+  /** Provenance for a local Codex or Claude conversation copied into screenpipe. */
+  importedFrom?: {
+    source: "claude-code" | "codex";
+    sourceId: string;
+    importedAt: number;
+    harness?: AgentHarness;
+  };
 }
 
 interface ConversationEntry {
@@ -459,6 +472,7 @@ async function orderedConversationEntries(dir: string): Promise<ConversationEntr
 
 export function conversationMetaFromJson(conv: any): ConversationMeta | null {
   if (!conv || typeof conv.id !== "string") return null;
+  if (isEphemeralSideConversationNamespaceId(conv.id)) return null;
 
   const messages = Array.isArray(conv.messages) ? conv.messages : [];
   let newestUserMessageAt: number | undefined;
@@ -503,6 +517,13 @@ export function conversationMetaFromJson(conv: any): ConversationMeta | null {
     dedupKey: conversationDedupIdentity(conv) ?? undefined,
     branchedFrom: typeof conv.branchedFrom === "string" ? conv.branchedFrom : undefined,
     presetId: typeof conv.presetId === "string" ? conv.presetId : undefined,
+    importedFrom:
+      conv.importedFrom &&
+      (conv.importedFrom.source === "claude-code" || conv.importedFrom.source === "codex") &&
+      typeof conv.importedFrom.sourceId === "string" &&
+      typeof conv.importedFrom.importedAt === "number"
+        ? conv.importedFrom
+        : undefined,
   };
 }
 
@@ -763,6 +784,7 @@ export async function updateConversationFlags(
   id: string,
   patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title" | "titleSource" | "browserState" | "lastViewedAt" | "sidebarGroup">>
 ): Promise<void> {
+  if (isEphemeralSideConversationNamespaceId(id)) return;
   // The read MUST happen inside the lock. Loading first and saving second was
   // the original lost-update: the sidebar would load a 4-message conversation,
   // the panel would persist a 5th message, and this write would then rename a

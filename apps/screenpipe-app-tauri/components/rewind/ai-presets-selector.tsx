@@ -16,15 +16,29 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { useModelUpsellGating } from "@/lib/hooks/use-model-upsell-gating";
 import { usePiModels } from "@/lib/hooks/use-pi-models";
 import { modelAllowanceNotice } from "@/lib/chat/model-allowance-cost";
-import { useMemo, useState, useEffect, useCallback, useRef } from "react";
+import {
+  useMemo,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from "react";
 import {
   acpAdapterInfo,
   generatePresetName,
+  primaryAcpAdapterChoices,
   presetImageClass,
   presetImageSrc,
 } from "@/lib/utils/preset-appearance";
-import { AcpAgentPicker } from "@/components/settings/acp-agent-picker";
-import { useAcpRolloutEnabled } from "@/lib/acp-rollout";
+import {
+  AcpAgentPicker,
+  acpAgentForSelection,
+} from "@/components/settings/acp-agent-picker";
+import {
+  useAcpRolloutEnabled,
+  useSelectableAcpAdapters,
+} from "@/lib/acp-rollout";
 import {
   Command,
   CommandEmpty,
@@ -93,6 +107,7 @@ import {
   ollamaContextWindowFromShow,
   resolveModelLimits,
 } from "@/lib/model-metadata";
+import { compactModelLabel } from "@/lib/utils/model-label";
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -143,6 +158,7 @@ interface AIProviderConfigProps {
   defaultPreset?: AIPreset;
   showLoginCta?: boolean;
 }
+
 interface OpenAIModel {
   id: string;
   created?: number;
@@ -213,8 +229,8 @@ export function AIProviderConfig({
   showLoginCta = true,
 }: AIProviderConfigProps) {
   const [selectedProvider, setSelectedProvider] = useState<
-    AIPreset["provider"]
-  >(defaultPreset?.provider || "openai");
+    AIPreset["provider"] | null
+  >(defaultPreset?.provider ?? null);
   const { settings } = useSettings();
   const [isLoading, setIsLoading] = useState(false);
   const [openaiModels, setOpenAIModels] = useState<OpenAIModel[]>([]);
@@ -227,33 +243,11 @@ export function AIProviderConfig({
   const [showApiKey, setShowApiKey] = useState(false);
   const { isManagedDeployment, policy: enterprisePolicy } = useManagedPolicy();
   const aiPresetPolicy = enterprisePolicy.aiPresetPolicy ?? DEFAULT_ENTERPRISE_AI_PRESET_POLICY;
-  const [piAvailable, setPiAvailable] = useState(false);
+  const showScreenpipeCloud =
+    !isManagedDeployment || aiPresetPolicy.allow_screenpipe_cloud;
   const { piModels, isLoading: loadingPiModels, upgradeEligible } = usePiModels();
   const showUpsell = useModelUpsellGating(upgradeEligible);
 
-  // Check Pi availability (installed at app startup by Rust background thread)
-  useEffect(() => {
-    const checkPi = async () => {
-      try {
-        const result = await commands.piCheck();
-        if (result.status === "ok" && result.data.available) {
-          setPiAvailable(true);
-        }
-      } catch (e) {
-        console.error("Failed to check pi:", e);
-      }
-    };
-    if (isManagedDeployment) {
-      setPiAvailable(aiPresetPolicy.allow_screenpipe_cloud);
-      return;
-    }
-    if (!isManagedDeployment) {
-      checkPi();
-    }
-    // Re-check periodically in case background install finishes
-    const interval = isManagedDeployment ? null : setInterval(checkPi, 5000);
-    return () => { if (interval) clearInterval(interval); };
-  }, [isManagedDeployment, aiPresetPolicy.allow_screenpipe_cloud]);
   const [formData, setFormData] = useState<AIPreset>({
     provider: defaultPreset?.provider || "openai",
     apiKey: defaultPreset?.apiKey || "",
@@ -322,6 +316,11 @@ export function AIProviderConfig({
   // fail-closed rollout gate, otherwise this selector would hand every user a
   // coding-agent provider the settings page deliberately hides.
   const acpEnabled = useAcpRolloutEnabled();
+  const acpAdapters = useSelectableAcpAdapters(formData.acpAgent?.id);
+  const primaryAcpAdapters = primaryAcpAdapterChoices(acpAdapters);
+  const customAcpAdapter = acpAdapters.find(
+    (adapter) => adapter.id === "custom",
+  );
 
   // A preset saved while the flag was on must not leave this editor stuck on a
   // provider whose picker is no longer rendered.
@@ -609,6 +608,11 @@ export function AIProviderConfig({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    if (!selectedProvider) {
+      toast.error("Choose an AI before continuing");
+      return;
+    }
+
     if (!validateId(formData.id)) {
       return;
     }
@@ -648,50 +652,25 @@ export function AIProviderConfig({
 
 
 
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(
+    selectedProvider === "custom" ||
+      selectedProvider === "openai-chatgpt" ||
+      selectedProvider === "anthropic" ||
+      selectedProvider === "native-ollama" ||
+      (selectedProvider === "acp" && formData.acpAgent?.id === "custom"),
+  );
 
   return (
     <div className="w-full space-y-3 rounded-lg bg-card p-4">
       <div>
         <h2 className="text-base font-semibold">
-          {defaultPreset?.id ? "edit ai provider" : "ai provider"}
+          {defaultPreset?.id ? "edit ai" : "choose your ai"}
         </h2>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-3">
-        <div className="space-y-1">
-          <Label htmlFor="name" className="flex items-center gap-2 text-xs">
-            name
-            {idError && (
-              <span className="text-xs text-destructive font-normal">
-                {idError}
-              </span>
-            )}
-          </Label>
-          <Input
-            id="name"
-            type="text"
-            placeholder="preset name"
-            value={formData.id ?? ""}
-            onChange={(e) => handleIdChange(e.target.value)}
-            onBlur={refillEmptyName}
-            className={cn(
-              "font-mono h-8 text-sm",
-              idError && "border-destructive focus-visible:ring-destructive",
-            )}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            disabled={
-              Boolean(defaultPreset?.id) &&
-              settings.aiPresets.some((p) => p.id === defaultPreset?.id)
-            }
-          />
-        </div>
-
         <div className="grid grid-cols-3 gap-2">
-          {piAvailable && (
+          {showScreenpipeCloud && (
             <Button
               type="button"
               disabled={!settings?.user?.token}
@@ -708,120 +687,61 @@ export function AIProviderConfig({
               }}
             >
               <Icons.terminal className="h-3.5 w-3.5" />
-              <span>screenpipe cloud</span>
+              <span>screenpipe</span>
             </Button>
           )}
 
-          <Button
-            type="button"
-            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              setSelectedProvider("openai-chatgpt");
-              setFormData({
-                ...formData,
-                provider: "openai-chatgpt",
-                url: "https://api.openai.com/v1",
-                model: "gpt-5.6-terra",
-              });
-            }}
-          >
-            <Icons.openai className="h-3.5 w-3.5" />
-            <span>chatgpt</span>
-          </Button>
+          {acpEnabled && primaryAcpAdapters.map((adapter) => {
+            const isSelected =
+              selectedProvider === "acp" &&
+              (formData.acpAgent?.id || "pi-acp") === adapter.id;
+            return (
+              <Button
+                key={adapter.id}
+                type="button"
+                variant={isSelected ? "default" : "outline"}
+                className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+                onClick={() => {
+                  const nextAgent = acpAgentForSelection(
+                    formData.acpAgent,
+                    adapter.id,
+                  );
+                  setSelectedProvider("acp");
+                  setFormData({
+                    ...formData,
+                    provider: "acp",
+                    url: "",
+                    model: nextAgent.id,
+                    acpAgent: nextAgent,
+                  });
+                }}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={adapter.imageSrc}
+                  alt=""
+                  className={cn(
+                    "h-3.5 w-3.5 rounded-sm",
+                    adapter.invertInDark && "dark:invert",
+                  )}
+                />
+                <span>{adapter.name}</span>
+              </Button>
+            );
+          })}
 
-          <Button
-            type="button"
-            variant={
-              selectedProvider === "native-ollama" ? "default" : "outline"
-            }
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              setSelectedProvider("native-ollama");
-              setFormData({
-                ...formData,
-                provider: "native-ollama",
-                url: "http://localhost:11434/v1",
-              });
-            }}
-          >
-            <Icons.terminal className="h-3.5 w-3.5" />
-            <span>ollama</span>
-          </Button>
-
-          <Button
-            type="button"
-            variant={selectedProvider === "custom" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              setSelectedProvider("custom");
-              setFormData({
-                ...formData,
-                provider: "custom",
-                url: "http://localhost:11434/v1",
-              });
-            }}
-          >
-            <Icons.settings className="h-3.5 w-3.5" />
-            <span>custom</span>
-          </Button>
-
-          <Button
-            type="button"
-            variant={(selectedProvider as string) === "anthropic" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              if ((selectedProvider as string) !== "anthropic") {
-                setSelectedProvider("anthropic");
-                setFormData({
-                  ...formData,
-                  provider: "anthropic",
-                  url: "",
-                  model: "claude-sonnet-5",
-                });
-              }
-            }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/images/claude-ai.svg" alt="Claude API" className="h-3.5 w-3.5 rounded-sm" />
-            <span>claude api</span>
-          </Button>
-
-          {acpEnabled && (
-          <Button
-            type="button"
-            variant={selectedProvider === "acp" ? "default" : "outline"}
-            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
-            onClick={() => {
-              if (selectedProvider === "acp") return;
-              setSelectedProvider("acp");
-              const agentId = formData.acpAgent?.id || "pi-acp";
-              setFormData({
-                ...formData,
-                provider: "acp",
-                url: "",
-                model: agentId,
-                acpAgent: formData.acpAgent || { id: "pi-acp" },
-              });
-            }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="/images/acp.svg"
-              alt="Coding agent"
-              className={cn(
-                "h-3.5 w-3.5 rounded-sm dark:invert",
-                selectedProvider === "acp" && "invert dark:invert-0",
-              )}
-            />
-            <span>coding agent</span>
-          </Button>
-          )}
         </div>
+
+        {!selectedProvider && (
+          <p className="text-xs text-muted-foreground">
+            choose one to continue
+          </p>
+        )}
 
         {acpEnabled && selectedProvider === "acp" && (
           <AcpAgentPicker
             compact
+            showAgentChoices={false}
             agent={formData.acpAgent}
             onChange={(next) =>
               setFormData({ ...formData, provider: "acp", model: next.id, acpAgent: next })
@@ -1091,7 +1011,7 @@ export function AIProviderConfig({
           </div>
         )}
 
-        {requiresAiPresetConnectionTest(selectedProvider) && (
+        {selectedProvider && requiresAiPresetConnectionTest(selectedProvider) && (
           <div className="space-y-2 border p-2.5">
             <div className="flex items-center justify-between gap-2">
               <div>
@@ -1135,6 +1055,39 @@ export function AIProviderConfig({
           </div>
         )}
 
+        {selectedProvider && (
+          <div className="space-y-1">
+            <Label htmlFor="name" className="flex items-center gap-2 text-xs">
+              name
+              {idError && (
+                <span className="text-xs text-destructive font-normal">
+                  {idError}
+                </span>
+              )}
+            </Label>
+            <Input
+              id="name"
+              type="text"
+              placeholder="generated automatically"
+              value={formData.id ?? ""}
+              onChange={(e) => handleIdChange(e.target.value)}
+              onBlur={refillEmptyName}
+              className={cn(
+                "font-mono h-8 text-sm",
+                idError && "border-destructive focus-visible:ring-destructive",
+              )}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              disabled={
+                Boolean(defaultPreset?.id) &&
+                settings.aiPresets.some((p) => p.id === defaultPreset?.id)
+              }
+            />
+          </div>
+        )}
+
         <button
           type="button"
           className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -1146,6 +1099,124 @@ export function AIProviderConfig({
 
         {showAdvanced && (
           <div className="space-y-1.5">
+            <div className="space-y-1">
+              <p className="text-xs font-medium">use a model directly</p>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("openai-chatgpt");
+                    setFormData({
+                      ...formData,
+                      provider: "openai-chatgpt",
+                      url: "https://api.openai.com/v1",
+                      model: "gpt-5.6-terra",
+                    });
+                  }}
+                >
+                  <Icons.openai className="h-3.5 w-3.5" />
+                  <span>chatgpt</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant={selectedProvider === "anthropic" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("anthropic");
+                    setFormData({
+                      ...formData,
+                      provider: "anthropic",
+                      url: "",
+                      model: "claude-sonnet-5",
+                    });
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src="/images/claude-ai.svg" alt="" className="h-3.5 w-3.5 rounded-sm" />
+                  <span>claude API</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant={selectedProvider === "native-ollama" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("native-ollama");
+                    setFormData({
+                      ...formData,
+                      provider: "native-ollama",
+                      url: "http://localhost:11434/v1",
+                    });
+                  }}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src="/images/ollama.png"
+                    alt=""
+                    className="h-3.5 w-3.5 object-contain dark:invert"
+                  />
+                  <span>ollama</span>
+                </Button>
+                <Button
+                  type="button"
+                  variant={selectedProvider === "custom" ? "default" : "outline"}
+                  className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                  onClick={() => {
+                    setSelectedProvider("custom");
+                    setFormData({
+                      ...formData,
+                      provider: "custom",
+                      url: "",
+                    });
+                  }}
+                >
+                  <Icons.settings className="h-3.5 w-3.5" />
+                  <span>use an API key</span>
+                </Button>
+              </div>
+            </div>
+            {acpEnabled && customAcpAdapter && (
+              <div className="space-y-1">
+                <p className="text-xs font-medium">connect another agent</p>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button
+                    type="button"
+                    variant={
+                      selectedProvider === "acp" &&
+                      formData.acpAgent?.id === customAcpAdapter.id
+                        ? "default"
+                        : "outline"
+                    }
+                    className="flex h-8 items-center justify-center gap-1.5 px-3 text-xs"
+                    onClick={() => {
+                      const nextAgent = acpAgentForSelection(
+                        formData.acpAgent,
+                        customAcpAdapter.id,
+                      );
+                      setSelectedProvider("acp");
+                      setFormData({
+                        ...formData,
+                        provider: "acp",
+                        url: "",
+                        model: nextAgent.id,
+                        acpAgent: nextAgent,
+                      });
+                    }}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={customAcpAdapter.imageSrc}
+                      alt=""
+                      className="h-3.5 w-3.5 rounded-sm"
+                    />
+                    <span>use a command</span>
+                  </Button>
+                </div>
+              </div>
+            )}
+            {selectedProvider && (
+              <>
             {resolvedModelLimits && (
               <p className="text-[10px] text-muted-foreground">
                 known model limits are configured automatically
@@ -1205,6 +1276,8 @@ export function AIProviderConfig({
                 className="min-h-[60px] max-h-[100px] text-xs resize-none"
               />
             </div>
+              </>
+            )}
           </div>
         )}
 
@@ -1213,6 +1286,7 @@ export function AIProviderConfig({
           className="w-full h-7 text-xs"
           disabled={
             isLoading ||
+            !selectedProvider ||
             Boolean(idError) ||
             !formData.id?.length ||
             !formData.model?.length ||
@@ -1267,10 +1341,13 @@ interface AIPresetsSelectorProps {
   triggerAriaLabel?: string;
   /** For tight composer UIs, show the active model instead of preset details. */
   showModelOnly?: boolean;
+  /** ACP composers expose the live model in a separate control, so the preset
+   *  switcher can collapse to the provider mark instead of repeating its name. */
+  providerIconOnly?: boolean;
   /** Notify parent surfaces when the preset popover opens or closes. */
   onOpenChange?: (open: boolean) => void;
-  /** Scheduled pipes still run through raw Pi and cannot execute ACP adapters. */
-  includeAgentPresets?: boolean;
+  /** Optional controls that belong with model selection in the same popover. */
+  popoverFooter?: ReactNode;
 }
 
 export const AIPresetDialog = ({
@@ -1367,8 +1444,9 @@ export const AIPresetsSelector = ({
   triggerClassName,
   triggerAriaLabel,
   showModelOnly = false,
+  providerIconOnly = false,
   onOpenChange,
-  includeAgentPresets = true,
+  popoverFooter,
 }: AIPresetsSelectorProps) => {
   const { settings, updateSettings } = useSettings();
   const [open, setOpen] = useState(false);
@@ -1394,13 +1472,10 @@ export const AIPresetsSelector = ({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const aiPresets = useMemo(() => {
     const presets = (settings?.aiPresets || []) as AIPreset[];
-    const policyPresets = isManagedDeployment
+    return isManagedDeployment
       ? filterPresetsForEnterprisePolicy(presets, aiPresetPolicy)
       : presets;
-    return includeAgentPresets
-      ? policyPresets
-      : policyPresets.filter((preset) => preset.provider !== "acp");
-  }, [settings?.aiPresets, isManagedDeployment, aiPresetPolicy, includeAgentPresets]);
+  }, [settings?.aiPresets, isManagedDeployment, aiPresetPolicy]);
 
   const selectedPreset = useMemo(() => {
     if (isControlled) {
@@ -1608,11 +1683,7 @@ export const AIPresetsSelector = ({
     // A newly created preset belongs to the controlled surface that created
     // it. Pass the full value so the host can activate it immediately without
     // waiting for the settings store to publish the updated preset list.
-    if (
-      isControlled &&
-      createdPreset &&
-      (includeAgentPresets || createdPreset.provider !== "acp")
-    ) {
+    if (isControlled && createdPreset) {
       onControlledSelect(createdPreset);
     }
 
@@ -1737,6 +1808,10 @@ export const AIPresetsSelector = ({
   );
   const isLastCloudPreset = (preset: AIPreset) =>
     preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed && cloudPresetCount <= 1;
+  const selectedProviderName =
+    selectedPresetData?.provider === "acp"
+      ? acpAdapterInfo(selectedPresetData.acpAgent?.id).name
+      : selectedPresetData?.provider || "AI";
 
   return (
     <>
@@ -1771,7 +1846,12 @@ export const AIPresetsSelector = ({
                   type="button"
                   variant="outline"
                   role="combobox"
-                  aria-label={triggerAriaLabel}
+                  aria-label={
+                    triggerAriaLabel ??
+                    (providerIconOnly
+                      ? `AI provider: ${selectedProviderName}. Change provider`
+                      : undefined)
+                  }
                   aria-expanded={open}
                   className={cn(
                     "w-full justify-between hover:bg-accent hover:text-accent-foreground",
@@ -1782,7 +1862,10 @@ export const AIPresetsSelector = ({
                 >
                   {selectedPreset ? (
                     showModelOnly ? (
-                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+                      <div className={cn(
+                        "flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden",
+                        providerIconOnly && "justify-center",
+                      )}>
                         {selectedPresetRequiresLogin && (
                           <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                         )}
@@ -1810,24 +1893,26 @@ export const AIPresetsSelector = ({
                             ),
                           )}
                         />
-                        <span
-                          className="truncate text-left font-medium"
-                          title={
-                            selectedPresetData
-                              ? `${selectedPresetData.id} (${selectedPresetData.model})`
-                              : undefined
-                          }
-                        >
-                          {/* ACP presets store the adapter id in `model`, so the
-                              raw slug ("claude-acp") is what showed here. Name
-                              the agent instead; the config control beside it
-                              names the model the agent is running. */}
-                          {selectedPresetData?.provider === "acp"
-                            ? acpAdapterInfo(selectedPresetData.acpAgent?.id).name
-                            : selectedPresetData?.model ||
-                              formatPresetName(selectedPreset)}
-                        </span>
-                        {selectedModelAllowanceNotice && (
+                        {!providerIconOnly && (
+                          <span
+                            className="truncate text-left font-medium"
+                            title={
+                              selectedPresetData
+                                ? `${selectedPresetData.id} (${selectedPresetData.model})`
+                                : undefined
+                            }
+                          >
+                            {/* ACP presets store the adapter id in `model`, so the
+                                raw slug ("claude-acp") is what showed here. Name
+                                the agent instead; the config control beside it
+                                names the model the agent is running. */}
+                            {selectedPresetData?.provider === "acp"
+                              ? acpAdapterInfo(selectedPresetData.acpAgent?.id).name
+                              : compactModelLabel(selectedPresetData?.model || "") ||
+                                formatPresetName(selectedPreset)}
+                          </span>
+                        )}
+                        {!providerIconOnly && selectedModelAllowanceNotice && (
                           <TooltipProvider>
                             <Tooltip>
                               <TooltipTrigger asChild>
@@ -1878,11 +1963,15 @@ export const AIPresetsSelector = ({
                   ) : (
                     "select ai preset..."
                   )}
-                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  {!providerIconOnly && (
+                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  )}
                 </Button>
               </PopoverTrigger>
               <TooltipContent>
-                {selectedPresetRequiresLogin ? (
+                {providerIconOnly ? (
+                  <p>{selectedProviderName} · switch provider</p>
+                ) : selectedPresetRequiresLogin ? (
                   <p className="text-muted-foreground">
                     Login required to use this preset
                   </p>
@@ -2032,6 +2121,7 @@ export const AIPresetsSelector = ({
                         handleOpenChange(false);
                       }}
                       className="flex py-2"
+                      data-testid={`ai-preset-option-${preset.id}`}
                     >
                       <div className="flex w-full items-center justify-between gap-2 overflow-hidden">
                         <div className="flex items-center gap-2 min-w-0">
@@ -2163,6 +2253,14 @@ export const AIPresetsSelector = ({
                 )}
               </CommandList>
             </Command>
+            {popoverFooter && (
+              <div
+                className="border-t border-border p-3"
+                data-testid="ai-preset-popover-footer"
+              >
+                {popoverFooter}
+              </div>
+            )}
           </PopoverContent>
         </Popover>
         </div>

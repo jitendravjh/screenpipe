@@ -31,6 +31,7 @@ import type { ChatSendOptions, Message } from "@/lib/chat/types";
 import { normalizeComposerMentionsForModel } from "@/lib/chat-utils";
 import { chatSendTelemetryContext } from "@/lib/chat/response-feedback";
 import type { PiSendTransportOptions } from "@/components/chat/standalone/hooks/pi-types";
+import type { ResolvedPiProviderConfig } from "@/components/chat/standalone/hooks/use-pi-session-lifecycle";
 
 type LivePiSessionCheck =
   | { running: true; info: PiInfo }
@@ -52,11 +53,122 @@ export function hasAuthoritativeActivePiTurn({
   return isStreaming || assistantMessageId !== null;
 }
 
+export function shouldInterruptActivePiTurn({
+  startedFreshPiSession,
+  ...turnState
+}: Parameters<typeof hasAuthoritativeActivePiTurn>[0] & {
+  startedFreshPiSession: boolean;
+}): boolean {
+  return !startedFreshPiSession && hasAuthoritativeActivePiTurn(turnState);
+}
+
 export async function awaitPendingPiPresetSwitch(
   promiseRef: { current: Promise<void> | null },
 ): Promise<void> {
   const pendingSwitch = promiseRef.current;
   if (pendingSwitch) await pendingSwitch;
+}
+
+/**
+ * Failures that happen before Pi accepts a prompt and are safe to redeliver
+ * after replacing the process. Provider/model errors are intentionally absent:
+ * retrying those would duplicate billing or hide an upstream failure.
+ */
+export function isRecoverablePiPromptDispatchError(error: string): boolean {
+  const normalized = error.toLowerCase();
+  return (
+    isPiPromptStartTimeout(error) ||
+    normalized.includes("pi not initialized") ||
+    normalized.includes("pi is not running") ||
+    normalized.includes("pi process has died") ||
+    normalized.includes("pi process died during") ||
+    normalized.includes("pi command queue dropped") ||
+    normalized.includes("pi command queue closed") ||
+    normalized.includes("stdin write failed") ||
+    normalized.includes("pi session restarted while preparing prompt")
+  );
+}
+
+export async function dispatchPiPromptWithRecovery<T>(
+  dispatch: () => Promise<Result<T, string>>,
+  recover: (error: string) => Promise<void>,
+): Promise<Result<T, string>> {
+  const first = await dispatch();
+  if (first.status !== "error" || !isRecoverablePiPromptDispatchError(first.error)) {
+    return first;
+  }
+
+  await recover(first.error);
+  return dispatch();
+}
+
+/**
+ * Wait for a background start to finish before dispatching a prompt.
+ *
+ * ACP processes can report `running` before their initialize/auth handshake is
+ * ready, so process liveness alone is not a safe readiness signal. The shared
+ * in-flight guard covers that complete handshake and is released by every
+ * start path in `finally`/cleanup.
+ */
+export async function awaitPiStartInFlight(
+  startInFlightRef: { current: boolean },
+  waitForNextTick: () => Promise<void> = () =>
+    new Promise((resolve) => setTimeout(resolve, 50)),
+): Promise<void> {
+  while (startInFlightRef.current) {
+    await waitForNextTick();
+  }
+}
+
+export async function prepareCodingWorkspaceForSend({
+  prompt,
+  prepare,
+  router,
+  sessionId,
+  startInFlightRef,
+  sessionSyncedRef,
+  stopPi = commands.piStop,
+  setPiInfo,
+}: {
+  prompt: string;
+  prepare?: (
+    prompt: string,
+    router?: {
+      providerConfig: ResolvedPiProviderConfig;
+      userToken: string | null;
+    },
+  ) => Promise<{ ok: boolean; created: boolean }>;
+  router?: {
+    providerConfig: ResolvedPiProviderConfig;
+    userToken: string | null;
+  };
+  sessionId: string | null;
+  startInFlightRef: { current: boolean };
+  sessionSyncedRef: { current: boolean };
+  stopPi?: typeof commands.piStop;
+  setPiInfo: (info: PiInfo | null) => void;
+}): Promise<{ proceed: boolean; error?: string }> {
+  if (!prepare) return { proceed: true };
+  let preparation: { ok: boolean; created: boolean };
+  try {
+    preparation = await prepare(prompt, router);
+  } catch (error) {
+    return {
+      proceed: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!preparation.ok) return { proceed: false };
+  if (!preparation.created) return { proceed: true };
+
+  await awaitPiStartInFlight(startInFlightRef);
+  const stopped = await stopPi(sessionId);
+  if (stopped.status === "error") {
+    return { proceed: false, error: stopped.error };
+  }
+  setPiInfo(stopped.data);
+  sessionSyncedRef.current = false;
+  return { proceed: true };
 }
 
 /** Read the process manager instead of trusting the render-time `piInfo`. */
@@ -136,6 +248,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     prefillContext,
     prefillFrameId,
     prefillSource,
+    prepareCodingWorkspace,
     resolveComposerMentions,
     restartCurrentPiSession,
     saveConversation,
@@ -213,13 +326,17 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     }
   }
 
-  async function interruptActivePiTurn(sessionId = piSessionIdRef.current) {
-    const hasActiveTurn = hasAuthoritativeActivePiTurn({
+  async function interruptActivePiTurn(
+    sessionId = piSessionIdRef.current,
+    startedFreshPiSession = false,
+  ) {
+    const shouldInterrupt = shouldInterruptActivePiTurn({
+      startedFreshPiSession,
       isLoading,
       isStreaming,
       assistantMessageId: piMessageIdRef.current,
     });
-    if (!hasActiveTurn) return;
+    if (!shouldInterrupt) return;
 
     let aborted = false;
     try {
@@ -310,8 +427,8 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
 
-    // A selector change may be in the narrow gap before React disables the
-    // composer. Wait for it here as the authoritative boundary. Rejections
+    // A selector change may still be in flight when the user submits. Wait for
+    // it here as the authoritative boundary. Rejections
     // (including "not now" during ACP authentication) abort this send before
     // a user bubble is persisted or a provider receives the prompt.
     try {
@@ -329,11 +446,19 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       return;
     }
 
+    // A new chat can warm an ACP harness in the background, and a crash can
+    // already be restarting the current harness. Keep the user's optimistic
+    // bubble visible and wait for that work instead of rejecting the send.
+    // This must happen before the liveness check: ACP may report a running
+    // process while its initialize/auth handshake is still in flight.
+    await awaitPiStartInFlight(piStartInFlightRef);
+
     // React's `piInfo` may still describe the process from before a completed
     // preset switch. Ask the process manager first so a successful switch is
     // not immediately started a second time, and a failed one cannot reuse the
     // stale provider.
     let liveSession: Awaited<ReturnType<typeof checkLivePiSession>>;
+    let startedFreshPiSession = false;
     try {
       liveSession = await checkLivePiSession(attemptSessionId, setAttemptPiInfo);
     } catch (e) {
@@ -343,26 +468,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
 
     // Auto-start Pi if it is actually not running (new session or recovery).
     if (!liveSession.running) {
-      if (piStartInFlightRef.current) {
-        if (!autoSendBypassRef.current) {
-          toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
-          finishAttempt();
-          return;
-        }
-        // Prefill auto-send: wait for in-flight start to complete
-        const startWait = Date.now();
-        while (piStartInFlightRef.current && Date.now() - startWait < 10000) {
-          await new Promise(r => setTimeout(r, 300));
-        }
-        if (piStartInFlightRef.current) {
-          finishAttempt();
-          return; // timed out
-        }
-      } else {
-        console.log("[Pi] Not running, auto-starting before sending message");
-        piStartInFlightRef.current = true;
-        setPiStarting(true);
+      console.log("[Pi] Not running, auto-starting before sending message");
+      piStartInFlightRef.current = true;
+      setPiStarting(true);
 
+      // Keep fallback bookkeeping local to this one start attempt.
+      {
         // Build a list of presets to try: active first, then other available
         // presets as fallbacks. This ensures that if the active preset fails
         // (e.g. ChatGPT OAuth expired), we try alternatives before giving up.
@@ -440,6 +551,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
                   });
                 }
                 started = true;
+                startedFreshPiSession = true;
                 break;
               } else {
                 lastError = result.status === "error"
@@ -542,7 +654,11 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         return;
       }
 
-      await interruptActivePiTurn(attemptSessionId);
+      // A process started by this send cannot have an active model turn yet.
+      // Restored chats can briefly retain stale streaming refs while their new
+      // Pi process starts; aborting that idle process wedges the first reply
+      // before its prompt is ever dispatched.
+      await interruptActivePiTurn(attemptSessionId, startedFreshPiSession);
     } catch (e) {
       finishAttempt();
       throw e;
@@ -772,48 +888,54 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         return;
       }
 
-      // Send prompt — abort/new_session now await completion, so no retry needed
+      // Send prompt. If the process failed before accepting it, replace that
+      // exact session and redeliver once. The native prompt-start watchdog
+      // stops a silent process before returning its timeout, so this cannot
+      // overlap a still-running copy of the turn.
       const displayPreview = queuedPreviewForText(displayLabel ?? displayUserMessage);
-      let result = await commands.piPrompt(
-        turnSessionId,
-        promptMessage,
-        piImages.length > 0 ? piImages : null,
-        displayPreview,
-      );
-
-      // Race: user hit "+ NEW" before Pi finished registering the new session
-      // in the pool. Auto-spawn once and retry before surfacing the error.
-      if (result.status === "error" && result.error.includes("Pi not initialized")) {
-        console.log("[Pi] session not registered yet — auto-spawning and retrying");
-        try {
-          const dir = await piProjectDirForSession(turnSessionId);
-          const providerConfig = buildProviderConfig(attemptPreset);
-          const startRes = await commands.piStart(
-            turnSessionId,
-            dir,
-            settings.user?.token ?? null,
-            providerConfig,
-          );
-          if (startRes.status === "ok" && startRes.data.running) {
-            if (isAttemptForeground()) {
-              setPiInfo(startRes.data);
-              piSessionSyncedRef.current = false;
-              if (providerConfig) {
-                setRunningConfigFromProviderConfig(providerConfig);
-              }
-            }
-            syncThinkingLevelAfterStart(turnSessionId);
-            result = await commands.piPrompt(
-              turnSessionId,
-              promptMessage,
-              piImages.length > 0 ? piImages : null,
-              displayPreview,
-            );
-          }
-        } catch (e) {
-          console.error("[Pi] auto-spawn retry failed", e);
+      const dispatchPrompt = () =>
+        commands.piPrompt(
+          turnSessionId,
+          promptMessage,
+          piImages.length > 0 ? piImages : null,
+          displayPreview,
+        );
+      const result = await dispatchPiPromptWithRecovery(dispatchPrompt, async (error) => {
+        console.warn(
+          "[Pi] prompt was not accepted — replacing process and retrying once:",
+          error,
+        );
+        // `piStart` reuses an identical live process. Explicitly stop first so
+        // a queue whose drain task closed while the child stayed alive cannot
+        // be mistaken for a healthy reusable session.
+        const stopRes = await commands.piStop(turnSessionId);
+        if (stopRes.status === "error") {
+          throw new Error(stopRes.error);
         }
-      }
+        const dir = await piProjectDirForSession(turnSessionId);
+        const providerConfig = buildProviderConfig(attemptPreset);
+        const startRes = await commands.piStart(
+          turnSessionId,
+          dir,
+          settings.user?.token ?? null,
+          providerConfig,
+        );
+        if (startRes.status !== "ok" || !startRes.data.running) {
+          throw new Error(
+            startRes.status === "error"
+              ? startRes.error
+              : startRes.data.startupError ?? "AI assistant did not restart",
+          );
+        }
+        if (isAttemptForeground()) {
+          setPiInfo(startRes.data);
+          piSessionSyncedRef.current = false;
+          if (providerConfig) {
+            setRunningConfigFromProviderConfig(providerConfig);
+          }
+        }
+        syncThinkingLevelAfterStart(turnSessionId);
+      });
 
       if (result.status === "error") {
         if (timeoutId) clearTimeout(timeoutId);
@@ -922,6 +1044,31 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
   ) {
     if ((!canChat && !autoSendBypassRef.current) || (!getActivePreset() && !autoSendBypassRef.current)) return;
     const originalTrimmed = userMessage.trim();
+    const routerProviderConfig = buildProviderConfig(getActivePreset());
+    const workspacePreparation = await prepareCodingWorkspaceForSend({
+      prompt: originalTrimmed,
+      prepare: prepareCodingWorkspace,
+      router: routerProviderConfig
+        ? {
+            providerConfig: routerProviderConfig,
+            userToken: settings.user?.token ?? null,
+          }
+        : undefined,
+      sessionId: piSessionIdRef.current,
+      startInFlightRef: piStartInFlightRef,
+      sessionSyncedRef: piSessionSyncedRef,
+      setPiInfo,
+    });
+    if (!workspacePreparation.proceed) {
+      if (workspacePreparation.error) {
+        toast({
+          title: "could not prepare coding workspace",
+          description: workspacePreparation.error,
+          variant: "destructive",
+        });
+      }
+      return;
+    }
     // Composer mentions (`@app`, `@audio`, `@"speaker"`, `#tag`, `~range`,
     // `$skill`) are resolved into an explicit context block here. Without this
     // the model receives the raw token and has to guess what the chips above

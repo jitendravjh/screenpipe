@@ -13,7 +13,7 @@
  *   ┌────────────────────────┐  emit chat-load-conversation  ┌───────────┐
  *   │ ChatSidebar (this file)├──────────────────────────────▶│ Standalone│
  *   │                        │                                │ Chat      │
- *   │  reads chat-store      │  emit chat-current-session     │           │
+ *   │  reads chat-store      │  sync matching panel session   │           │
  *   │  emits user actions    │◀──────────────────────────────┤ (mounts   │
  *   │                        │                                │  Pi via   │
  *   │                        │                                │  piStart) │
@@ -31,6 +31,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Image from "next/image";
 import { useInterval } from "@/lib/hooks/use-interval";
 import { useTauriEvent } from "@/lib/hooks/use-tauri-event";
 import {
@@ -46,6 +47,9 @@ import {
   Pencil,
   FolderOpen,
   Timer,
+  Terminal,
+  MoreHorizontal,
+  GitBranch,
 } from "lucide-react";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -55,25 +59,34 @@ import {
   useChatStore,
   useChatActions,
   useOrderedSessions,
+  isEmptyChatShell,
+  selectDisplayedChatId,
   sessionRecordFromMeta,
+  fallbackOpenChatId,
   type SessionRecord,
 } from "@/lib/stores/chat-store";
 import {
   conversationMetaFromJson,
   deleteConversationFile,
+  listConversations,
   loadConversationFile,
   saveConversationFile,
   updateConversationFlags,
 } from "@/lib/chat-storage";
 import { commands } from "@/lib/utils/tauri";
 import { isInjectedTitle } from "@/lib/chat-utils";
+import { createConversationBranch } from "@/lib/chat/branch-conversation";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuShortcut,
   DropdownMenuSub,
@@ -83,8 +96,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   ContextMenu,
+  ContextMenuCheckboxItem,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuRadioGroup,
+  ContextMenuRadioItem,
   ContextMenuSeparator,
   ContextMenuShortcut,
   ContextMenuSub,
@@ -124,33 +141,175 @@ import {
 import { parsePipeSessionId } from "@/lib/events/types";
 import type { ChatConversation } from "@/lib/hooks/use-settings";
 import {
+  startExternalChatSync,
+  type ExternalChatSyncController,
+} from "@/lib/chat/external-chat-sync";
+import type {
+  ExternalChatSource,
+  ExternalChatTurnState,
+} from "@/lib/chat/external-chat-parser";
+import {
   PIPES_SIDEBAR_COLLAPSED_EVENT,
   PIPES_SIDEBAR_COLLAPSED_KEY,
 } from "@/lib/sidebar-pipes";
 import {
   applySidebarRecentsCap,
-  buildSidebarRecentsSections,
+  buildGroupedRecents,
   latestSidebarPipeRunTimes,
   listMoveTargetGroups,
+  mergeSidebarPipeInventory,
   recurringPipeGroupKeys,
+  SIDEBAR_AUTOMATION_PAGE_SIZE,
+  sortSidebarPipeRuns,
   visibleSidebarPipeNames,
   sessionGroupKey,
+  type SidebarPipeInventoryItem,
   type SidebarItem,
   type SidebarRecentsSection,
   validateSidebarGroupName,
 } from "@/lib/utils/chat-sidebar-grouping";
 
 /** Max top-level rows shown in recents. Pipes use the authoritative inventory. */
-const SIDEBAR_CAP = 15;
+const SIDEBAR_CAP = 8;
 const PIPE_RUNS_PER_GROUP = 10;
-const PIPE_INVENTORY_PAGE_SIZE = 20;
 const DELETED_PIPE_EXECUTIONS_KEY = "screenpipe:deleted-pipe-executions";
+const RECENTS_SOURCE_FILTER_KEY = "screenpipe:recents-hidden-sources";
+const RECENTS_LAYOUT_KEY = "screenpipe:recents-layout";
+const RECENTS_SORT_KEY = "screenpipe:recents-sort";
 
-interface SidebarPipeInventoryItem {
-  name: string;
-  executionCount: number;
-  latestExecutionId: number;
-  lastRun: string | null;
+type RecentSource = "screenpipe" | ExternalChatSource;
+type RecentLayout = "source" | "list";
+type RecentSort = "priority" | "updated";
+const RECENT_SOURCE_OPTIONS: Array<{ source: RecentSource; label: string }> = [
+  { source: "screenpipe", label: "screenpipe" },
+  { source: "codex", label: "Codex" },
+  { source: "claude-code", label: "Claude" },
+];
+const RECENT_SOURCE_ICONS: Record<RecentSource, string> = {
+  screenpipe: "/images/screenpipe.png",
+  codex: "/images/codex.svg",
+  "claude-code": "/images/claude-ai.svg",
+};
+const RECENT_SOURCE_SHORTCUTS = {
+  screenpipe: "s",
+  codex: "c",
+  "claude-code": "l",
+} as const satisfies Record<RecentSource, string>;
+const RECENTS_MENU_SHORTCUT_KEYS = ["s", "c", "l", "b", "i", "p", "u"] as const;
+
+function recentSource(session: SessionRecord): RecentSource {
+  return session.importedFrom?.source ?? "screenpipe";
+}
+
+export function visibleRecentSourceOptions(): typeof RECENT_SOURCE_OPTIONS {
+  return RECENT_SOURCE_OPTIONS;
+}
+
+export function RecentsSourceFilterLabel({
+  source,
+  label,
+}: {
+  source: RecentSource;
+  label: string;
+}) {
+  return (
+    <span className="flex min-w-0 flex-1 items-center gap-2">
+      <Image
+        src={RECENT_SOURCE_ICONS[source]}
+        alt=""
+        width={16}
+        height={16}
+        className="h-4 w-4 shrink-0 rounded-sm object-contain"
+        unoptimized
+      />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
+export function isMachineOnlyImportedConversation(
+  session: Pick<SessionRecord, "importedFrom" | "title" | "titleSource">,
+): boolean {
+  return Boolean(
+    session.importedFrom
+    && session.titleSource !== "user"
+    && isInjectedTitle(session.title),
+  );
+}
+
+export function filterRecentsBySource(
+  sessions: SessionRecord[],
+  hiddenSources: ReadonlySet<RecentSource>,
+): SessionRecord[] {
+  return sessions.filter((session) => !hiddenSources.has(recentSource(session)));
+}
+
+export function sortRecents(
+  sessions: SessionRecord[],
+  sort: RecentSort,
+): SessionRecord[] {
+  if (sort === "priority") return sessions;
+
+  // Loading a chat can update persistence metadata such as `updatedAt` and
+  // `lastViewedAt`. Sort by message activity so selecting a row never promotes
+  // it above chats that actually received newer content.
+  const contentActivityAt = (session: SessionRecord) =>
+    session.lastContentAt
+    ?? session.lastUserMessageAt
+    ?? session.updatedAt
+    ?? session.createdAt;
+
+  return [...sessions].sort(
+    (left, right) =>
+      contentActivityAt(right) - contentActivityAt(left) ||
+      right.createdAt - left.createdAt ||
+      left.id.localeCompare(right.id),
+  );
+}
+
+function readRecentLayout(): RecentLayout {
+  try {
+    return localStorage.getItem(RECENTS_LAYOUT_KEY) === "source" ? "source" : "list";
+  } catch {
+    return "list";
+  }
+}
+
+function readRecentSort(): RecentSort {
+  try {
+    return localStorage.getItem(RECENTS_SORT_KEY) === "updated" ? "updated" : "priority";
+  } catch {
+    return "priority";
+  }
+}
+
+export function hiddenRecentSourcesFromStoredValue(
+  stored: string | null,
+): Set<RecentSource> {
+  if (stored === null) return new Set();
+
+  try {
+    const parsed = JSON.parse(stored);
+    return new Set(
+      Array.isArray(parsed)
+        ? parsed.filter((source): source is RecentSource =>
+            source === "screenpipe" || source === "codex" || source === "claude-code",
+          )
+        : [],
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function readHiddenRecentSources(): Set<RecentSource> {
+  try {
+    return hiddenRecentSourcesFromStoredValue(
+      localStorage.getItem(RECENTS_SOURCE_FILTER_KEY),
+    );
+  } catch {
+    return hiddenRecentSourcesFromStoredValue(null);
+  }
 }
 
 interface SidebarPipeExecution {
@@ -238,8 +397,11 @@ function useVisibleChatSections(): {
     const archived: SessionRecord[] = [];
     for (const s of sessions) {
       // Hide drafts (no user message sent yet)
-      // Once a message is sent, draft is cleared and the chat becomes visible
-      if (s.draft) continue;
+      // Once a message is sent, draft is cleared and the chat becomes visible.
+      // `isEmptyChatShell` is the derived backstop for rows whose creator
+      // never set the flag (prewarmed / auto-restarted Pi sessions used to
+      // land here as empty "untitled" rows).
+      if (s.draft || isEmptyChatShell(s) || isMachineOnlyImportedConversation(s)) continue;
       if (s.hidden) {
         archived.push(s);
         continue;
@@ -294,13 +456,14 @@ function useQueueDepths(): Map<string, number> {
  * background — those belong to the parent.
  */
 export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
-  const currentId = useChatStore((s) => s.currentId);
+  const currentId = useChatStore(selectDisplayedChatId);
   // Reactive group key for the current session — re-evaluates when the
   // session appears in the store (handles the race where currentId is set
   // before the session record lands).
   const currentSessionGroupKey = useChatStore((s) => {
-    if (!s.currentId) return null;
-    const session = s.sessions[s.currentId];
+    const displayedId = selectDisplayedChatId(s);
+    if (!displayedId) return null;
+    const session = s.sessions[displayedId];
     if (!session || (session.kind === "pipe-watch" && session.isLoading)) return null;
     return sessionGroupKey(session);
   });
@@ -319,12 +482,13 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   // mirroring the html/body `scrollbar-hide` convention in globals.css.
   const { isMac } = usePlatform();
 
-  // Sync currentId from standalone-chat. Whenever the chat panel switches
-  // its piSessionIdRef (new chat, prefill auto-send, history click in the
-  // panel itself), it emits this event so the sidebar can highlight the
-  // matching row. Without this the sidebar would silently disagree with
-  // the chat about "which session is current".
+  // Tauri events are app-global, while each WebView owns a separate chat
+  // store. Only let this WebView's panel select a working tab. A floating
+  // Chat session still reaches Home's Recents through chat-conversation-saved,
+  // but must not become a second Home tab merely because it became current in
+  // the floating window.
   useTauriEvent<{ id: string }>("chat-current-session", (e) => {
+    if (useChatStore.getState().panelSessionId !== e.payload.id) return;
     actions.setCurrent(e.payload.id);
   });
 
@@ -335,7 +499,10 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
 
-    const syncConversationFromDisk = async (id: string) => {
+    const syncConversationFromDisk = async (
+      id: string,
+      externalTurnState?: ExternalChatTurnState,
+    ) => {
       try {
         const conv = await loadConversationFile(id);
         if (cancelled || !conv) return;
@@ -384,24 +551,53 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
             pipeContext: meta.pipeContext,
             dedupKey: meta.dedupKey,
             branchedFrom: meta.branchedFrom,
+            importedFrom: meta.importedFrom,
             draft: false,
           });
-          return;
+        } else {
+          store.actions.upsert(sessionRecordFromMeta(meta));
         }
 
-        store.actions.upsert(sessionRecordFromMeta(meta));
+        if (externalTurnState) {
+          const active = externalTurnState.isLoading || externalTurnState.isStreaming;
+          const assistant = [...conv.messages]
+            .reverse()
+            .find((message) => message.role === "assistant");
+          store.actions.setMessages(id, conv.messages as any);
+          store.actions.setStreaming(id, {
+            isLoading: externalTurnState.isLoading,
+            isStreaming: externalTurnState.isStreaming,
+            streamingMessageId: active ? assistant?.id ?? null : null,
+            streamingText:
+              active && assistant?.content !== "Processing..."
+                ? assistant?.content ?? ""
+                : "",
+            contentBlocks: active ? assistant?.contentBlocks ?? [] : [],
+          });
+          store.actions.patch(id, {
+            status: active ? "streaming" : "idle",
+            lastError: undefined,
+          });
+        }
       } catch {
         // ignore: a later save / hydrate can repair the row
       }
     };
 
     (async () => {
-      const unlistenSaved = await listen<{ id: string }>(
+      const unlistenSaved = await listen<{
+        id: string;
+        importedFrom?: ExternalChatSource;
+        turnState?: ExternalChatTurnState;
+      }>(
         "chat-conversation-saved",
         (event) => {
-          const id = event.payload?.id;
+          const { id, importedFrom, turnState } = event.payload ?? {};
           if (!id) return;
-          void syncConversationFromDisk(id);
+          void syncConversationFromDisk(
+            id,
+            importedFrom ? turnState : undefined,
+          );
         }
       );
       unlistenFns.push(unlistenSaved);
@@ -427,7 +623,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
             useChatStore.getState().actions.patch(id, {
               hidden,
               unread: false,
-              ...(hidden ? { draft: false } : {}),
+              ...(hidden ? { draft: false, pinned: false } : {}),
             });
             return;
           }
@@ -476,10 +672,111 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     };
   }, [actions]);
 
+  // Local Codex and Claude histories are part of the chat index, not a
+  // separate import workflow. Watch their native transcripts while the app is
+  // open; a bounded focus reconciliation recovers any events the OS dropped.
+  useEffect(() => {
+    let cancelled = false;
+    let controller: ExternalChatSyncController | null = null;
+    const hydrate = async () => {
+      const metas = await listConversations({ includeHidden: true });
+      if (!cancelled) actions.hydrateFromDisk(metas.map(sessionRecordFromMeta));
+    };
+    const start = async () => {
+      try {
+        const nextController = await startExternalChatSync();
+        if (cancelled) {
+          nextController.stop();
+          return;
+        }
+        controller = nextController;
+        await hydrate();
+      } catch (error) {
+        console.warn("[chat-sidebar] external chat sync failed", error);
+      }
+    };
+    void start();
+    const onFocus = () => {
+      if (!controller) return;
+      void controller.syncNow().then(hydrate).catch((error) => {
+        console.warn("[chat-sidebar] external chat reconciliation failed", error);
+      });
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      controller?.stop();
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [actions]);
+
   const { pinned, recents, pipes, archived } = useVisibleChatSections();
+  const [hiddenRecentSources, setHiddenRecentSources] = useState<Set<RecentSource>>(
+    readHiddenRecentSources,
+  );
+  const [recentLayout, setRecentLayout] = useState<RecentLayout>(readRecentLayout);
+  const [recentSort, setRecentSort] = useState<RecentSort>(readRecentSort);
+  const visibleRecents = useMemo(
+    () => sortRecents(filterRecentsBySource(recents, hiddenRecentSources), recentSort),
+    [recents, hiddenRecentSources, recentSort],
+  );
+  const toggleRecentSource = useCallback((source: RecentSource) => {
+    setHiddenRecentSources((current) => {
+      const next = new Set(current);
+      if (next.has(source)) next.delete(source);
+      else next.add(source);
+      try {
+        localStorage.setItem(RECENTS_SOURCE_FILTER_KEY, JSON.stringify([...next]));
+      } catch {
+        // The in-memory filter still works for this session.
+      }
+      return next;
+    });
+  }, []);
+  const changeRecentLayout = useCallback((layout: string) => {
+    const next = layout === "source" ? "source" : "list";
+    setRecentLayout(next);
+    try {
+      localStorage.setItem(RECENTS_LAYOUT_KEY, next);
+    } catch {
+      // The in-memory preference still works for this session.
+    }
+  }, []);
+  const changeRecentSort = useCallback((sort: string) => {
+    const next = sort === "updated" ? "updated" : "priority";
+    setRecentSort(next);
+    try {
+      localStorage.setItem(RECENTS_SORT_KEY, next);
+    } catch {
+      // The in-memory preference still works for this session.
+    }
+  }, []);
   const groupedSections = useMemo(
-    () => buildSidebarRecentsSections(recents, Number.POSITIVE_INFINITY),
-    [recents],
+    () => recentLayout === "source"
+      ? RECENT_SOURCE_OPTIONS.flatMap(({ source, label }) => {
+          const sessions = visibleRecents.filter((session) => recentSource(session) === source);
+          return sessions.length === 0
+            ? []
+            : [{
+                key: `source:${source}`,
+                title: label,
+                items: buildGroupedRecents(
+                  sessions,
+                  Number.POSITIVE_INFINITY,
+                  () => null,
+                ),
+              }];
+        })
+      : [{
+          key: "all-recents",
+          title: "",
+          items: buildGroupedRecents(
+            visibleRecents,
+            Number.POSITIVE_INFINITY,
+            () => null,
+          ),
+        }],
+    [recentLayout, visibleRecents],
   );
 
   const [pipesCollapsed, setPipesCollapsed] = useCollapsedPref(
@@ -489,6 +786,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   const [pipeInventory, setPipeInventory] = useState<SidebarPipeInventoryItem[]>([]);
   const [pipeInventoryLoaded, setPipeInventoryLoaded] = useState(false);
   const [pipeInventoryAuthoritative, setPipeInventoryAuthoritative] = useState(false);
+  const pipeInventoryAuthoritativeRef = useRef(false);
   const [pipeInventoryLoadingMore, setPipeInventoryLoadingMore] = useState(false);
   const [pipeInventoryHasMore, setPipeInventoryHasMore] = useState(false);
   const pipeInventoryCursorRef = useRef<number | null>(null);
@@ -523,6 +821,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     setPipeInventory([]);
     setPipeInventoryLoaded(false);
     setPipeInventoryAuthoritative(false);
+    pipeInventoryAuthoritativeRef.current = false;
     setPipeInventoryHasMore(false);
     pipeInventoryCursorRef.current = null;
   }, []);
@@ -542,10 +841,12 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     preserveExisting = false,
   ) => {
     const generation = pipeDataGenerationRef.current;
+    const recoveringInitialPage =
+      preserveExisting && !pipeInventoryAuthoritativeRef.current;
     if (append) setPipeInventoryLoadingMore(true);
     try {
       const params = new URLSearchParams({
-        limit: String(PIPE_INVENTORY_PAGE_SIZE),
+        limit: String(SIDEBAR_AUTOMATION_PAGE_SIZE),
       });
       if (append && pipeInventoryCursorRef.current != null) {
         params.set("before_id", String(pipeInventoryCursorRef.current));
@@ -568,21 +869,25 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
           lastRun: typeof pipe.last_run_at === "string" ? pipe.last_run_at : null,
         });
       }
-      setPipeInventory((previous) => {
-        if (!append && !preserveExisting) return page;
-        const merged = new Map(previous.map((pipe) => [pipe.name, pipe]));
-        for (const pipe of page) merged.set(pipe.name, pipe);
-        return Array.from(merged.values()).sort(
-          (a, b) => b.latestExecutionId - a.latestExecutionId,
-        );
-      });
+      setPipeInventory((previous) =>
+        mergeSidebarPipeInventory(
+          previous,
+          page,
+          append
+            ? "append"
+            : preserveExisting && !recoveringInitialPage
+              ? "refresh"
+              : "replace",
+        ),
+      );
       // A heartbeat refreshes only the newest page. Preserve the pagination
       // cursor and older inventory rows the user explicitly loaded.
-      if (!preserveExisting) {
+      if (!preserveExisting || recoveringInitialPage) {
         setPipeInventoryHasMore(payload.has_more === true);
         pipeInventoryCursorRef.current =
           typeof payload.next_before_id === "number" ? payload.next_before_id : null;
       }
+      pipeInventoryAuthoritativeRef.current = true;
       setPipeInventoryAuthoritative(true);
     } catch {
       // Keep recent in-memory pipe groups available if the engine is still
@@ -738,7 +1043,11 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       else sessionsByPipe.set(name, [session]);
     }
 
-    const orderedNames = visibleSidebarPipeNames(pipeInventory, pipes);
+    const orderedNames = visibleSidebarPipeNames(
+      pipeInventory,
+      pipes,
+      pipeInventoryAuthoritative,
+    );
 
     return orderedNames.map((name) => {
       const inventoryItem = pipeInventory.find((pipe) => pipe.name === name);
@@ -760,11 +1069,13 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       });
       const merged = [...(sessionsByPipe.get(name) ?? []), ...cached];
       const seen = new Set<string>();
-      const sessions = merged.filter((session) => {
-        if (seen.has(session.id)) return false;
-        seen.add(session.id);
-        return true;
-      });
+      const sessions = sortSidebarPipeRuns(
+        merged.filter((session) => {
+          if (seen.has(session.id)) return false;
+          seen.add(session.id);
+          return true;
+        }),
+      );
       return {
         kind: "group" as const,
         key: `pipe:${name}`,
@@ -773,7 +1084,13 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
         sessions,
       };
     });
-  }, [pipeInventory, pipes, loadedPipeRuns, storeSessionIds]);
+  }, [
+    pipeInventory,
+    pipeInventoryAuthoritative,
+    pipes,
+    loadedPipeRuns,
+    storeSessionIds,
+  ]);
 
   const pipeLastRuns = useMemo(
     () => latestSidebarPipeRunTimes(pipeInventory, pipes),
@@ -999,7 +1316,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       !isTerminalPipeExecutionStatus(fullExecution.status)
     ) {
       toast({
-        title: "couldn't load scheduled run",
+        title: "couldn't load automation run",
         description: "the execution output is temporarily unavailable",
         variant: "destructive",
       });
@@ -1054,31 +1371,40 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     // Stop any active session first to avoid immediate row resurrection
     // from trailing stream events.
     commands.piAbort(id).catch(() => {});
-    actions.patch(id, { hidden: true, unread: false });
+    actions.patch(id, { hidden: true, pinned: false, unread: false });
     // Archiving should tuck chats away immediately; users can reopen
     // the bucket manually when they want to review archived items.
     setArchivedCollapsed(true);
-    // Move the panel off a chat that just left the visible list.
+    const fallbackId = fallbackOpenChatId(useChatStore.getState(), id);
+    actions.closeChat(id);
+    // Move the panel off a chat that just left the visible list. Prefer
+    // the next open tab; mint untitled only when this was the last one.
     if (id === currentId) {
-      const fresh = crypto.randomUUID();
-      actions.upsert({
-        id: fresh,
-        title: "untitled",
-        preview: "",
-        status: "idle",
-        messageCount: 0,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        pinned: false,
-        unread: false,
-        draft: true,
-      });
-      actions.setCurrent(fresh);
-      emit("chat-load-conversation", { conversationId: fresh });
+      if (fallbackId) {
+        actions.setCurrent(fallbackId);
+        emit("chat-load-conversation", { conversationId: fallbackId });
+      } else {
+        const fresh = crypto.randomUUID();
+        actions.upsert({
+          id: fresh,
+          title: "untitled",
+          preview: "",
+          status: "idle",
+          messageCount: 0,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          unread: false,
+          draft: true,
+          messages: [],
+        });
+        actions.setCurrent(fresh);
+        emit("chat-load-conversation", { conversationId: fresh });
+      }
     }
     // Best-effort persistence for restart durability.
     try {
-      await updateConversationFlags(id, { hidden: true });
+      await updateConversationFlags(id, { hidden: true, pinned: false });
     } catch {
       // ignore
     }
@@ -1086,6 +1412,50 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       await emit("chat-visibility-changed", { id, hidden: true });
     } catch {
       // ignore
+    }
+  };
+
+  const handleBranch = async (id: string) => {
+    setOpenConversationMenuId(null);
+    const executionMetadata = executionMetadataRef.current.get(id);
+    if (
+      executionMetadata &&
+      !(await materializePipeExecution(id, executionMetadata))
+    ) {
+      return;
+    }
+
+    try {
+      const source = await loadConversationFile(id);
+      if (!source) throw new Error("conversation is not available on disk");
+      const branch = createConversationBranch({
+        sourceId: id,
+        title: source.title,
+        messages: source.messages,
+      });
+      if (!branch) throw new Error("conversation has no messages to branch");
+
+      await saveConversationFile(branch);
+      const meta = conversationMetaFromJson(branch);
+      if (!meta) throw new Error("branched conversation is invalid");
+      actions.upsert(sessionRecordFromMeta(meta));
+      actions.setMessages(branch.id, branch.messages as any);
+      try {
+        await emit("chat-conversation-saved", {
+          id: branch.id,
+          title: branch.title,
+        });
+      } catch {
+        // The branch is already durable and available in this window.
+      }
+      await handleSelect(branch.id);
+    } catch (error) {
+      console.warn("[chat-sidebar] failed to branch conversation:", error);
+      toast({
+        title: "couldn't branch chat",
+        description: "the conversation could not be copied. try again.",
+        variant: "destructive",
+      });
     }
   };
 
@@ -1142,6 +1512,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
         pinned: false,
         unread: false,
         draft: true,
+        messages: [],
       });
       actions.setCurrent(fresh);
       emit("chat-load-conversation", { conversationId: fresh });
@@ -1235,7 +1606,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     // (Timeline / Memories / ...) and look misaligned.
     <div
       className={cn(
-        "flex flex-col min-h-0 text-sm px-2 overflow-y-auto overflow-x-hidden",
+        "flex flex-1 flex-col min-h-0 text-sm px-2 overflow-y-auto overflow-x-hidden",
         isMac ? "scrollbar-minimal" : "scrollbar-hide",
         className
       )}
@@ -1269,6 +1640,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                     onDeleteRequest={setDeletingSessionId}
                     onTogglePin={handleTogglePin}
                     onRenameRequest={handleRenameRequest}
+                    onBranch={handleBranch}
                     openConversationMenuId={openConversationMenuId}
                     setOpenConversationMenuId={setOpenConversationMenuId}
                   />
@@ -1283,35 +1655,147 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
               collapsed={recentsCollapsed}
               onCollapsedChange={setRecentsCollapsed}
               headerAction={
-                <span
-                  role="button"
-                  tabIndex={onViewAll ? 0 : -1}
-                  className={cn(
-                    "ml-auto inline-flex items-center gap-0.5 select-none",
-                    "text-[10px] uppercase tracking-wider transition-colors",
-                    "opacity-0 group-hover/recents:opacity-100",
-                    (recentsCollapsed || !hasAnythingToView) && "hidden",
-                    onViewAll
-                      ? "sidebar-text-secondary hover:text-foreground cursor-pointer"
-                      : "text-foreground/[0.35] cursor-default"
-                  )}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (!onViewAll) return;
-                    onViewAll();
-                  }}
-                  onKeyDown={(e) => {
-                    if (!onViewAll) return;
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      onViewAll();
-                    }
-                  }}
-                  aria-disabled={!onViewAll}
-                >
-                  View all <ChevronRight className="h-3 w-3" aria-hidden />
-                </span>
+                <div className="group ml-auto flex items-center gap-1">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        className="inline-flex h-5 w-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-muted/40 focus-visible:opacity-100 group-hover:opacity-100"
+                        aria-label="organize recents"
+                        title="organize recents"
+                      >
+                        <MoreHorizontal className="h-3.5 w-3.5" aria-hidden />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      className="w-52"
+                      align="end"
+                      onKeyDown={handleRecentsMenuShortcut}
+                    >
+                      <DropdownMenuLabel>show in recents</DropdownMenuLabel>
+                      {visibleRecentSourceOptions().map(({ source, label }) => (
+                        <DropdownMenuCheckboxItem
+                          key={source}
+                          data-shortcut={RECENT_SOURCE_SHORTCUTS[source]}
+                          aria-keyshortcuts={RECENT_SOURCE_SHORTCUTS[source].toUpperCase()}
+                          checked={!hiddenRecentSources.has(source)}
+                          onCheckedChange={() => toggleRecentSource(source)}
+                          onSelect={(event) => event.preventDefault()}
+                        >
+                          <RecentsSourceFilterLabel source={source} label={label} />
+                          <DropdownMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            {RECENT_SOURCE_SHORTCUTS[source].toUpperCase()}
+                          </DropdownMenuShortcut>
+                        </DropdownMenuCheckboxItem>
+                      ))}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuLabel>organize sidebar</DropdownMenuLabel>
+                      <DropdownMenuRadioGroup value={recentLayout} onValueChange={changeRecentLayout}>
+                        <DropdownMenuRadioItem data-shortcut="b" aria-keyshortcuts="B" value="source">
+                          By source
+                          <DropdownMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            B
+                          </DropdownMenuShortcut>
+                        </DropdownMenuRadioItem>
+                        <DropdownMenuRadioItem data-shortcut="i" aria-keyshortcuts="I" value="list">
+                          In one list
+                          <DropdownMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            I
+                          </DropdownMenuShortcut>
+                        </DropdownMenuRadioItem>
+                      </DropdownMenuRadioGroup>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuLabel>sort chats by</DropdownMenuLabel>
+                      <DropdownMenuRadioGroup value={recentSort} onValueChange={changeRecentSort}>
+                        <DropdownMenuRadioItem data-shortcut="p" aria-keyshortcuts="P" value="priority">
+                          Priority
+                          <DropdownMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            P
+                          </DropdownMenuShortcut>
+                        </DropdownMenuRadioItem>
+                        <DropdownMenuRadioItem data-shortcut="u" aria-keyshortcuts="U" value="updated">
+                          Last updated
+                          <DropdownMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            U
+                          </DropdownMenuShortcut>
+                        </DropdownMenuRadioItem>
+                      </DropdownMenuRadioGroup>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <ContextMenu>
+                    <ContextMenuTrigger asChild>
+                      <button
+                        type="button"
+                        className={cn(
+                          "inline-flex items-center gap-0.5 text-[10px] uppercase tracking-wider opacity-0 transition-[color,opacity] group-hover:opacity-100 focus-visible:opacity-100",
+                          (recentsCollapsed || !hasAnythingToView) && "hidden",
+                          onViewAll
+                            ? "sidebar-text-secondary hover:text-foreground"
+                            : "text-foreground/[0.35] cursor-default"
+                        )}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onViewAll?.();
+                        }}
+                        disabled={!onViewAll}
+                        title="view all · right-click to filter"
+                      >
+                        View all <ChevronRight className="h-3 w-3" aria-hidden />
+                      </button>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent className="w-52" onKeyDown={handleRecentsMenuShortcut}>
+                      <ContextMenuLabel>show in recents</ContextMenuLabel>
+                      {visibleRecentSourceOptions().map(({ source, label }) => (
+                        <ContextMenuCheckboxItem
+                          key={source}
+                          data-testid={`recents-filter-${source}`}
+                          data-shortcut={RECENT_SOURCE_SHORTCUTS[source]}
+                          aria-keyshortcuts={RECENT_SOURCE_SHORTCUTS[source].toUpperCase()}
+                          checked={!hiddenRecentSources.has(source)}
+                          onCheckedChange={() => toggleRecentSource(source)}
+                          onSelect={(event) => event.preventDefault()}
+                        >
+                          <RecentsSourceFilterLabel source={source} label={label} />
+                          <ContextMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            {RECENT_SOURCE_SHORTCUTS[source].toUpperCase()}
+                          </ContextMenuShortcut>
+                        </ContextMenuCheckboxItem>
+                      ))}
+                      <ContextMenuSeparator />
+                      <ContextMenuLabel>organize sidebar</ContextMenuLabel>
+                      <ContextMenuRadioGroup value={recentLayout} onValueChange={changeRecentLayout}>
+                        <ContextMenuRadioItem data-shortcut="b" aria-keyshortcuts="B" value="source">
+                          By source
+                          <ContextMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            B
+                          </ContextMenuShortcut>
+                        </ContextMenuRadioItem>
+                        <ContextMenuRadioItem data-shortcut="i" aria-keyshortcuts="I" value="list">
+                          In one list
+                          <ContextMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            I
+                          </ContextMenuShortcut>
+                        </ContextMenuRadioItem>
+                      </ContextMenuRadioGroup>
+                      <ContextMenuSeparator />
+                      <ContextMenuLabel>sort chats by</ContextMenuLabel>
+                      <ContextMenuRadioGroup value={recentSort} onValueChange={changeRecentSort}>
+                        <ContextMenuRadioItem data-shortcut="p" aria-keyshortcuts="P" value="priority">
+                          Priority
+                          <ContextMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            P
+                          </ContextMenuShortcut>
+                        </ContextMenuRadioItem>
+                        <ContextMenuRadioItem data-shortcut="u" aria-keyshortcuts="U" value="updated">
+                          Last updated
+                          <ContextMenuShortcut className="text-[10px] tracking-normal text-muted-foreground/55">
+                            U
+                          </ContextMenuShortcut>
+                        </ContextMenuRadioItem>
+                      </ContextMenuRadioGroup>
+                    </ContextMenuContent>
+                  </ContextMenu>
+                </div>
               }
               bodyClassName=""
             >
@@ -1321,9 +1805,11 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                     <Skeleton key={i} className="h-6 w-full rounded-md" />
                   ))}
                 </div>
-              ) : recents.length === 0 ? (
+              ) : visibleRecents.length === 0 ? (
                 <div className="px-2.5 py-2 text-xs sidebar-text-secondary italic">
-                  {pinned.length === 0 && pipes.length === 0
+                  {recents.length > 0
+                    ? "no chats match filters"
+                    : pinned.length === 0 && pipes.length === 0
                     ? "no chats yet — click + to start"
                     : "no recent chats"}
                 </div>
@@ -1342,6 +1828,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                   onDeleteRequest={setDeletingSessionId}
                   onTogglePin={handleTogglePin}
                   onRenameRequest={handleRenameRequest}
+                  onBranch={handleBranch}
                   onMoveToGroup={handleMoveToGroup}
                   onNewGroupRequest={setNewGroupSessionId}
                   existingGroups={existingGroups}
@@ -1354,7 +1841,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
 
           <div className="group/pipes min-h-0 flex flex-col shrink-0">
               <Section
-                title="scheduled"
+                title="automations"
                 collapsed={pipesCollapsed}
                 onCollapsedChange={updatePipesCollapsed}
                 headerAction={
@@ -1370,7 +1857,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                   </div>
                 ) : pipeItems.length === 0 ? (
                   <div className="px-2.5 py-2 text-xs sidebar-text-secondary italic">
-                    no scheduled runs yet
+                    no automation runs yet
                   </div>
                 ) : pipeItems.map((item) => (
                     <PipeGroupRow
@@ -1391,6 +1878,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                       onDeleteRequest={setDeletingSessionId}
                       onTogglePin={handleTogglePin}
                       onRenameRequest={handleRenameRequest}
+                      onBranch={handleBranch}
                       onMoveToGroup={handleMoveToGroup}
                       onNewGroupRequest={setNewGroupSessionId}
                       existingGroups={existingGroups}
@@ -1405,7 +1893,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
                     onClick={() => void fetchPipeInventory(true)}
                     disabled={pipeInventoryLoadingMore}
                   >
-                    {pipeInventoryLoadingMore ? "loading…" : "show more scheduled tasks"}
+                    {pipeInventoryLoadingMore ? "loading…" : "show more automation runs"}
                   </button>
                 )}
               </Section>
@@ -1548,6 +2036,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
     </div>
   );
 }
@@ -1807,10 +2296,7 @@ function Section({
 }) {
   return (
     <div className="flex flex-col min-h-0">
-      <button
-        type="button"
-        data-testid={`sidebar-section-${title}`}
-        onClick={() => onCollapsedChange(!collapsed)}
+      <div
         className={cn(
           // Light header row — avoid the "boxed section" look.
           "group/section shrink-0 px-2.5 py-1 flex items-center gap-1 rounded-sm text-left",
@@ -1819,45 +2305,40 @@ function Section({
           "focus:outline-none",
           tone === "subtle" ? "hover:bg-muted/10" : "hover:bg-muted/15"
         )}
-        aria-expanded={!collapsed}
       >
-        <span
-          className={cn(
-            "text-[10px] uppercase tracking-wider flex-1",
-            "sidebar-text-tertiary",
-            "group-hover/section:text-foreground/[0.75] group-focus-within/section:text-foreground/[0.75]"
-          )}
+        <button
+          type="button"
+          data-testid={`sidebar-section-${title}`}
+          onClick={() => onCollapsedChange(!collapsed)}
+          className="flex min-w-0 flex-1 items-center gap-1 text-left focus:outline-none"
+          aria-expanded={!collapsed}
         >
-          <span className="inline-flex items-center gap-1">
-            <span>{title}</span>
-            <span
-              className={cn(
-                "inline-flex items-center transition-opacity",
-                // Hidden by default; appears on hover/focus of the section group.
-                "opacity-0 group-hover/section:opacity-100 group-focus-visible/section:opacity-100"
-              )}
-              aria-hidden
-            >
-              {collapsed ? (
-                <ChevronRight
-                  className={cn(
-                    "h-3 w-3",
-                    "sidebar-text-tertiary",
-                    "group-hover/section:text-foreground/[0.75] group-focus-visible/section:text-foreground/[0.75]"
-                  )}
-                />
-              ) : (
-                <ChevronDown
-                  className={cn(
-                    "h-3 w-3",
-                    "sidebar-text-tertiary",
-                    "group-hover/section:text-foreground/[0.75] group-focus-visible/section:text-foreground/[0.75]"
-                  )}
-                />
-              )}
+          <span
+            className={cn(
+              "text-[10px] uppercase tracking-wider flex-1",
+              "sidebar-text-tertiary",
+              "group-hover/section:text-foreground/[0.75] group-focus-within/section:text-foreground/[0.75]"
+            )}
+          >
+            <span className="inline-flex items-center gap-1">
+              <span>{title}</span>
+              <span
+                className={cn(
+                  "inline-flex items-center transition-opacity",
+                  // Hidden by default; appears on hover/focus of the section group.
+                  "opacity-0 group-hover/section:opacity-100 group-focus-visible/section:opacity-100"
+                )}
+                aria-hidden
+              >
+                {collapsed ? (
+                  <ChevronRight className="h-3 w-3 sidebar-text-tertiary" />
+                ) : (
+                  <ChevronDown className="h-3 w-3 sidebar-text-tertiary" />
+                )}
+              </span>
             </span>
           </span>
-        </span>
+        </button>
         {headerAction}
         {count !== undefined && (
           <span
@@ -1869,7 +2350,7 @@ function Section({
             {count}
           </span>
         )}
-      </button>
+      </div>
       <div
         className={cn(
           // overflow-hidden here ensures paint stays within the animated
@@ -1905,6 +2386,7 @@ function RecentsBody({
   onDeleteRequest,
   onTogglePin,
   onRenameRequest,
+  onBranch,
   onMoveToGroup,
   onNewGroupRequest,
   existingGroups,
@@ -1924,6 +2406,7 @@ function RecentsBody({
   onDeleteRequest: (id: string | null) => void;
   onTogglePin: (id: string) => Promise<void> | void;
   onRenameRequest: (id: string) => void;
+  onBranch: (id: string) => Promise<void> | void;
   onMoveToGroup: (id: string, group: string | undefined) => void;
   onNewGroupRequest: (id: string) => void;
   existingGroups: string[];
@@ -1943,6 +2426,7 @@ function RecentsBody({
         onDeleteRequest={onDeleteRequest}
         onTogglePin={onTogglePin}
         onRenameRequest={onRenameRequest}
+        onBranch={onBranch}
         onMoveToGroup={onMoveToGroup}
         onNewGroupRequest={onNewGroupRequest}
         existingGroups={existingGroups}
@@ -1963,6 +2447,7 @@ function RecentsBody({
         onDeleteRequest={onDeleteRequest}
         onTogglePin={onTogglePin}
         onRenameRequest={onRenameRequest}
+        onBranch={onBranch}
         onMoveToGroup={onMoveToGroup}
         onNewGroupRequest={onNewGroupRequest}
         existingGroups={existingGroups}
@@ -2031,6 +2516,7 @@ function PipeGroupRow({
   onDeleteRequest,
   onTogglePin,
   onRenameRequest,
+  onBranch,
   onMoveToGroup,
   onNewGroupRequest,
   existingGroups,
@@ -2053,6 +2539,7 @@ function PipeGroupRow({
   onDeleteRequest: (id: string | null) => void;
   onTogglePin: (id: string) => Promise<void> | void;
   onRenameRequest: (id: string) => void;
+  onBranch: (id: string) => Promise<void> | void;
   onMoveToGroup: (id: string, group: string | undefined) => void;
   onNewGroupRequest: (id: string) => void;
   existingGroups: string[];
@@ -2115,6 +2602,7 @@ function PipeGroupRow({
               onDeleteRequest={onDeleteRequest}
               onTogglePin={onTogglePin}
               onRenameRequest={onRenameRequest}
+              onBranch={onBranch}
               insideGroup
               openConversationMenuId={openConversationMenuId}
               setOpenConversationMenuId={setOpenConversationMenuId}
@@ -2148,6 +2636,7 @@ interface ChatRowProps {
   onDeleteRequest: (id: string | null) => void;
   onTogglePin: (id: string) => Promise<void> | void;
   onRenameRequest: (id: string) => void;
+  onBranch?: (id: string) => Promise<void> | void;
   onMoveToGroup?: (id: string, group: string | undefined) => void;
   onNewGroupRequest?: (id: string) => void;
   existingGroups?: string[];
@@ -2162,20 +2651,20 @@ interface ChatRowProps {
  * Each maps to an item carrying `data-shortcut={key}`; pressing the key while a
  * row menu is open selects that item. Keep in sync with `RowMenuItems`.
  */
-const ROW_MENU_SHORTCUT_KEYS = ["p", "r", "a", "d"] as const;
+const ROW_MENU_SHORTCUT_KEYS = ["p", "r", "b", "a", "d"] as const;
 
 /**
- * Press a shortcut letter while a chat-row menu (right-click or kebab) is open
- * to fire the matching action. We forward an Enter keydown to the item so radix
- * runs its own onSelect + close — no second code path to keep in sync.
+ * Press a shortcut letter while a menu is open to fire the matching item. We
+ * forward Enter so radix runs its own onSelect + close — no second action path.
  */
-function handleRowMenuShortcut(e: React.KeyboardEvent<HTMLElement>) {
+export function handleMenuShortcut(
+  e: React.KeyboardEvent<HTMLElement>,
+  allowedKeys: readonly string[],
+) {
   if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
   if (e.key.length !== 1) return;
   const key = e.key.toLowerCase();
-  if (!ROW_MENU_SHORTCUT_KEYS.includes(key as (typeof ROW_MENU_SHORTCUT_KEYS)[number])) {
-    return;
-  }
+  if (!allowedKeys.includes(key)) return;
   const target = e.currentTarget.querySelector<HTMLElement>(`[data-shortcut="${key}"]`);
   if (!target) return;
   e.preventDefault();
@@ -2184,6 +2673,14 @@ function handleRowMenuShortcut(e: React.KeyboardEvent<HTMLElement>) {
   target.dispatchEvent(
     new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
   );
+}
+
+function handleRecentsMenuShortcut(e: React.KeyboardEvent<HTMLElement>) {
+  handleMenuShortcut(e, RECENTS_MENU_SHORTCUT_KEYS);
+}
+
+function handleRowMenuShortcut(e: React.KeyboardEvent<HTMLElement>) {
+  handleMenuShortcut(e, ROW_MENU_SHORTCUT_KEYS);
 }
 
 /**
@@ -2228,6 +2725,7 @@ function RowMenuItems({
   onDeleteRequest,
   onTogglePin,
   onRenameRequest,
+  onBranch,
   onMoveToGroup,
   onNewGroupRequest,
   existingGroups,
@@ -2240,6 +2738,7 @@ function RowMenuItems({
   onDeleteRequest: (id: string | null) => void;
   onTogglePin: (id: string) => Promise<void> | void;
   onRenameRequest: (id: string) => void;
+  onBranch?: (id: string) => Promise<void> | void;
   onMoveToGroup?: (id: string, group: string | undefined) => void;
   onNewGroupRequest?: (id: string) => void;
   existingGroups?: string[];
@@ -2275,6 +2774,22 @@ function RowMenuItems({
         Rename
         <P.Shortcut className={shortcutCls}>R</P.Shortcut>
       </P.Item>
+      {onBranch && (
+        <P.Item
+          data-shortcut="b"
+          aria-keyshortcuts="B"
+          className={itemCls}
+          disabled={session.messageCount === 0}
+          onSelect={(e: Event) => {
+            e.stopPropagation();
+            void onBranch(session.id);
+          }}
+        >
+          <GitBranch className="h-3 w-3 text-muted-foreground" />
+          Branch in new chat
+          <P.Shortcut className={shortcutCls}>B</P.Shortcut>
+        </P.Item>
+      )}
       {onMoveToGroup && existingGroups && (
         <P.Sub>
           <P.SubTrigger
@@ -2418,6 +2933,7 @@ export function SidebarChatRow({
   onDeleteRequest,
   onTogglePin,
   onRenameRequest,
+  onBranch,
   onMoveToGroup,
   onNewGroupRequest,
   existingGroups,
@@ -2454,11 +2970,42 @@ export function SidebarChatRow({
     onDeleteRequest,
     onTogglePin,
     onRenameRequest,
+    onBranch,
     onMoveToGroup,
     onNewGroupRequest,
     existingGroups,
     availableMoveGroups,
   };
+  const importedSource = session.importedFrom?.source;
+  const sourceLabel =
+    importedSource === "claude-code"
+      ? "Claude"
+      : importedSource === "codex"
+        ? "Codex"
+        : null;
+  const harness = session.importedFrom?.harness ?? (sourceLabel ? null : "screenpipe");
+  const harnessLabel =
+    harness === "github-copilot"
+      ? "GitHub Copilot"
+      : harness === "cursor"
+        ? "Cursor"
+        : harness === "screenpipe"
+          ? "screenpipe"
+          : harness === "terminal"
+            ? "Terminal"
+            : null;
+  const harnessIcon =
+    harness === "github-copilot"
+      ? "/images/acp/github-copilot-cli.svg"
+      : harness === "cursor"
+        ? "/images/cursor.png"
+        : harness === "screenpipe"
+          ? "/images/screenpipe.png"
+          : harness === "terminal"
+            ? null
+            : importedSource === "claude-code"
+              ? "/images/claude-ai.svg"
+              : "/images/codex.svg";
   // The row is both the click target and the right-click (context menu)
   // anchor. The kebab below stays as a discoverable, mouse-only entry point;
   // both menus render the same `RowMenuItems`.
@@ -2496,12 +3043,31 @@ export function SidebarChatRow({
           onSelect(session.id);
         }}
       >
+        <span
+          className="flex h-5 w-5 shrink-0 items-center justify-center"
+          aria-label={harnessLabel ? `${harnessLabel} harness` : `${sourceLabel} source`}
+          title={harnessLabel ? `${harnessLabel}${sourceLabel ? ` · ${sourceLabel}` : ""}` : sourceLabel ?? undefined}
+        >
+          {harnessIcon ? (
+            <Image
+              src={harnessIcon}
+              alt=""
+              width={17}
+              height={17}
+              className="h-[17px] w-[17px] rounded-sm object-contain"
+              unoptimized
+            />
+          ) : (
+            <Terminal className="h-4 w-4 sidebar-text-tertiary" aria-hidden />
+          )}
+        </span>
         {!insideGroup && (session.kind === "pipe-run" || session.kind === "pipe-watch") && (
           <Timer className="h-3 w-3 shrink-0 sidebar-text-tertiary" aria-hidden />
         )}
-        <span
-          className={cn(
-            "truncate flex-1 text-xs font-normal",
+        <span className="min-w-0 flex-1">
+          <span
+            className={cn(
+            "block truncate text-xs font-normal",
             isUnread
               ? "font-medium text-foreground"
               : isCurrent
@@ -2510,8 +3076,9 @@ export function SidebarChatRow({
                   ? "sidebar-text-tertiary"
                 : "sidebar-text-secondary"
           )}
-        >
-          {session.streamingTitle || (isInjectedTitle(session.title) ? undefined : session.title) || "untitled"}
+          >
+            {session.streamingTitle || (isInjectedTitle(session.title) ? undefined : session.title) || "untitled"}
+          </span>
         </span>
         <span className="ml-1 h-4 w-10 shrink-0 relative flex items-center justify-end">
           <span
@@ -2636,11 +3203,9 @@ function RowRightSignal({
       return {
         content: (
           <span
-            className="font-mono text-[10px] leading-none text-foreground inline-flex items-center justify-center w-2.5 h-2.5"
+            className="inline-block h-1.5 w-1.5 rounded-full bg-foreground"
             aria-label="unread"
-          >
-            █
-          </span>
+          />
         ),
         label: "new",
       };
