@@ -13,6 +13,16 @@ export interface ExternalChatParseOptions {
   importedAt?: number;
 }
 
+export interface ExternalChatTurnState {
+  isLoading: boolean;
+  isStreaming: boolean;
+}
+
+export interface ExternalChatTranscriptSnapshot {
+  conversation: ChatConversation | null;
+  turnState: ExternalChatTurnState;
+}
+
 const MAX_TITLE_CHARS = 80;
 const MAX_TOOL_RESULT_CHARS = 20_000;
 
@@ -63,7 +73,10 @@ function safeIdPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180) || "unknown";
 }
 
-function conversationId(source: ExternalChatSource, sourceId: string): string {
+export function externalChatConversationId(
+  source: ExternalChatSource,
+  sourceId: string,
+): string {
   return `imported-${source}-${safeIdPart(sourceId)}`;
 }
 
@@ -77,7 +90,14 @@ function messageId(
 }
 
 function titleFromText(text: string): string {
-  const compact = text.replace(/\s+/g, " ").trim();
+  const withoutAttachmentMarkup = text.replace(
+    /\n\s*<image\s+name=\[Image #[^\n]*(?:\s*<\/image>)?\s*$/i,
+    "",
+  );
+  const compact = withoutAttachmentMarkup
+    .replace(/(?:&#x20;|&#32;|&nbsp;)/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (!compact) return "imported chat";
   return compact.length <= MAX_TITLE_CHARS
     ? compact
@@ -125,7 +145,7 @@ function finishConversation({
   const cleanExplicitTitle = explicitTitle?.trim();
 
   return {
-    id: conversationId(source, sourceId),
+    id: externalChatConversationId(source, sourceId),
     title: cleanExplicitTitle
       ? titleFromText(cleanExplicitTitle)
       : titleFromText(fallbackTitle ?? `${source === "claude-code" ? "Claude Code" : "Codex"} chat`),
@@ -217,6 +237,13 @@ function parseToolArgs(value: unknown): Record<string, unknown> {
   return value == null ? {} : { input: value };
 }
 
+function parseCodexToolArgs(name: string | undefined, value: unknown): Record<string, unknown> {
+  if ((name === "exec" || name === "exec_command") && typeof value === "string") {
+    return { command: value };
+  }
+  return parseToolArgs(value);
+}
+
 function appendUniqueBlock(message: ChatMessage, block: ImportedContentBlock): void {
   const blocks = message.contentBlocks ?? [];
   if (
@@ -234,10 +261,10 @@ function appendUniqueBlock(message: ChatMessage, block: ImportedContentBlock): v
   message.contentBlocks = blocks;
 }
 
-export function parseClaudeCodeTranscript(
+function parseClaudeCodeTranscriptSnapshot(
   jsonl: string,
   options: ExternalChatParseOptions,
-): ChatConversation | null {
+): ExternalChatTranscriptSnapshot {
   const records = parseJsonLines(jsonl);
   const fallbackTimestamp = options.fallbackTimestamp;
   const importedAt = options.importedAt ?? Date.now();
@@ -247,6 +274,9 @@ export function parseClaudeCodeTranscript(
   let sessionId = options.sourceId;
   let aiTitle: string | undefined;
   let customTitle: string | undefined;
+  let turnActive = false;
+  let activeTurnKey = "pending";
+  let activeTurnTimestamp = fallbackTimestamp;
 
   for (const [index, record] of records.entries()) {
     const type = asString(record.type);
@@ -257,6 +287,16 @@ export function parseClaudeCodeTranscript(
     }
     if (type === "custom-title") {
       customTitle = asString(record.customTitle) ?? customTitle;
+      continue;
+    }
+    if (type === "system" && asString(record.subtype) === "turn_duration") {
+      turnActive = false;
+      for (const toolCall of toolCalls.values()) {
+        if (toolCall.isRunning) {
+          toolCall.isRunning = false;
+          delete toolCall.startedAtMs;
+        }
+      }
       continue;
     }
     if ((type !== "user" && type !== "assistant") || record.isSidechain === true) continue;
@@ -277,6 +317,8 @@ export function parseClaudeCodeTranscript(
         if (toolCall) {
           toolCall.result = truncateToolResult(block?.content);
           toolCall.isError = block?.is_error === true;
+          toolCall.isRunning = false;
+          delete toolCall.startedAtMs;
         }
       }
 
@@ -288,6 +330,9 @@ export function parseClaudeCodeTranscript(
       if (isMeta) continue;
       const text = texts.join("\n\n").trim();
       if (!text) continue;
+      turnActive = true;
+      activeTurnKey = asString(record.uuid) ?? String(index);
+      activeTurnTimestamp = timestamp;
       messages.push({
         id: messageId("claude-code", sessionId, asString(record.uuid), index),
         role: "user",
@@ -342,23 +387,53 @@ export function parseClaudeCodeTranscript(
           id: callId,
           toolName: asString(block.name) ?? "tool",
           args: parseToolArgs(block.input),
-          isRunning: false,
+          isRunning: true,
+          startedAtMs: timestamp,
         };
         toolCalls.set(callId, toolCall);
         appendUniqueBlock(assistant, { type: "tool", toolCall });
       }
     }
+
+    const reachedVisibleEndTurn = asString(messageRecord.stop_reason) === "end_turn"
+      && asArray(content).some((rawBlock) => {
+        const block = asRecord(rawBlock);
+        return asString(block?.type) === "text" && Boolean(asString(block?.text)?.trim());
+      });
+    if (reachedVisibleEndTurn) turnActive = false;
   }
 
-  return finishConversation({
-    source: "claude-code",
-    sourceId: sessionId,
-    messages,
-    explicitTitle: customTitle ?? aiTitle,
-    titleSource: customTitle ? "user" : aiTitle ? "ai" : undefined,
-    fallbackTimestamp,
-    importedAt,
-  });
+  if (turnActive && messages.at(-1)?.role === "user") {
+    messages.push({
+      id: messageId("claude-code", sessionId, `live-${activeTurnKey}`, messages.length),
+      role: "assistant",
+      content: "Processing...",
+      contentBlocks: [],
+      timestamp: activeTurnTimestamp,
+      provider: "claude-code",
+      importedFrom: "claude-code",
+    });
+  }
+
+  return {
+    conversation: finishConversation({
+      source: "claude-code",
+      sourceId: sessionId,
+      messages,
+      explicitTitle: customTitle ?? aiTitle,
+      titleSource: customTitle ? "user" : aiTitle ? "ai" : undefined,
+      fallbackTimestamp,
+      importedAt,
+    }),
+    turnState: { isLoading: turnActive, isStreaming: turnActive },
+  };
+}
+
+export function parseClaudeCodeTranscript(
+  jsonl: string,
+  options: ExternalChatParseOptions,
+): ChatConversation | null {
+  return parseClaudeCodeTranscriptSnapshot(jsonl, options).conversation;
 }
 
 function isCodexHarnessContext(text: string): boolean {
@@ -368,10 +443,49 @@ function isCodexHarnessContext(text: string): boolean {
     || trimmed.startsWith("<permissions instructions>");
 }
 
-export function parseCodexTranscript(
+const SCREENPIPE_SYSTEM_CONTEXT_OPEN = "<screenpipe-system-context>";
+const SCREENPIPE_SYSTEM_CONTEXT_CLOSE = "</screenpipe-system-context>";
+const CODEX_FILES_SECTION = "# Files mentioned by the user:";
+const CODEX_REQUEST_HEADING = /^## My request:\s*$/m;
+
+/**
+ * Recover the text the person actually submitted from Codex's user item.
+ *
+ * Screenpipe's ACP runtime prepends a system-context envelope, while Codex's
+ * attachment handoff prepends a file inventory and puts the typed request
+ * below `## My request:`. Both are transport metadata: keeping them in the
+ * imported transcript makes machine instructions look like user messages and
+ * lets them become the visible sidebar title.
+ */
+function cleanCodexUserText(text: string): string {
+  let clean = text.trim();
+  if (!clean || isCodexHarnessContext(clean)) return "";
+
+  if (clean.startsWith(SCREENPIPE_SYSTEM_CONTEXT_OPEN)) {
+    const closeIndex = clean.indexOf(SCREENPIPE_SYSTEM_CONTEXT_CLOSE);
+    if (closeIndex === -1) return "";
+    clean = clean
+      .slice(closeIndex + SCREENPIPE_SYSTEM_CONTEXT_CLOSE.length)
+      .trim();
+  }
+
+  if (clean.startsWith(CODEX_FILES_SECTION)) {
+    const requestHeading = CODEX_REQUEST_HEADING.exec(clean);
+    if (requestHeading) {
+      clean = clean.slice(requestHeading.index + requestHeading[0].length).trim();
+    }
+  }
+
+  return clean
+    .replace(/(?:&#x20;|&#32;|&nbsp;)/gi, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+
+function parseCodexTranscriptSnapshot(
   jsonl: string,
   options: ExternalChatParseOptions,
-): ChatConversation | null {
+): ExternalChatTranscriptSnapshot {
   const records = parseJsonLines(jsonl);
   const fallbackTimestamp = options.fallbackTimestamp;
   const importedAt = options.importedAt ?? Date.now();
@@ -381,6 +495,9 @@ export function parseCodexTranscript(
   let sessionId = options.sourceId;
   let pendingTimestamp = fallbackTimestamp;
   let syntheticAssistantIndex = 0;
+  let turnActive = false;
+  let activeTurnKey = "pending";
+  let activeTurnTimestamp = fallbackTimestamp;
 
   const flushPendingAssistant = () => {
     if (pendingBlocks.length === 0) return;
@@ -407,6 +524,25 @@ export function parseCodexTranscript(
     if (!payload) continue;
     const timestamp = timestampMs(record.timestamp, fallbackTimestamp);
 
+    if (recordType === "event_msg") {
+      const eventType = asString(payload.type);
+      if (eventType === "task_started") {
+        turnActive = true;
+        activeTurnKey = asString(payload.turn_id) ?? activeTurnKey;
+        activeTurnTimestamp = timestamp;
+      }
+      if (eventType === "task_complete") {
+        turnActive = false;
+        for (const toolCall of pendingToolCalls.values()) {
+          if (toolCall.isRunning) {
+            toolCall.isRunning = false;
+            delete toolCall.startedAtMs;
+          }
+        }
+      }
+      continue;
+    }
+
     if (recordType === "session_meta") {
       sessionId = asString(payload.id) ?? asString(payload.session_id) ?? sessionId;
       continue;
@@ -423,11 +559,12 @@ export function parseCodexTranscript(
       const text = textBlocks(payload.content, allowed).join("\n\n").trim();
       if (role === "user") {
         flushPendingAssistant();
-        if (!text || isCodexHarnessContext(text)) continue;
+        const userText = cleanCodexUserText(text);
+        if (!userText) continue;
         messages.push({
           id: messageId("codex", sessionId, asString(payload.id), index),
           role: "user",
-          content: text,
+          content: userText,
           timestamp,
           provider: "codex",
           importedFrom: "codex",
@@ -464,11 +601,13 @@ export function parseCodexTranscript(
 
     if (payloadType === "function_call" || payloadType === "custom_tool_call") {
       const callId = asString(payload.call_id) ?? asString(payload.id) ?? `tool-${index}`;
+      const toolName = asString(payload.name) ?? "tool";
       const toolCall = {
         id: callId,
-        toolName: asString(payload.name) ?? "tool",
-        args: parseToolArgs(payload.arguments ?? payload.input),
-        isRunning: false,
+        toolName,
+        args: parseCodexToolArgs(toolName, payload.arguments ?? payload.input),
+        isRunning: true,
+        startedAtMs: timestamp,
       };
       pendingToolCalls.set(callId, toolCall);
       pendingBlocks.push({ type: "tool", toolCall });
@@ -479,19 +618,54 @@ export function parseCodexTranscript(
     if (payloadType === "function_call_output" || payloadType === "custom_tool_call_output") {
       const callId = asString(payload.call_id);
       const toolCall = callId ? pendingToolCalls.get(callId) : undefined;
-      if (toolCall) toolCall.result = truncateToolResult(payload.output);
+      if (toolCall) {
+        toolCall.result = truncateToolResult(payload.output);
+        toolCall.isRunning = false;
+        delete toolCall.startedAtMs;
+      }
       pendingTimestamp = timestamp;
     }
   }
 
   flushPendingAssistant();
-  return finishConversation({
-    source: "codex",
-    sourceId: sessionId,
-    messages,
-    fallbackTimestamp,
-    importedAt,
-  });
+  if (turnActive && messages.at(-1)?.role === "user") {
+    messages.push({
+      id: messageId("codex", sessionId, `live-${activeTurnKey}`, messages.length),
+      role: "assistant",
+      content: "Processing...",
+      contentBlocks: [],
+      timestamp: activeTurnTimestamp,
+      provider: "codex",
+      importedFrom: "codex",
+    });
+  }
+  return {
+    conversation: finishConversation({
+      source: "codex",
+      sourceId: sessionId,
+      messages,
+      fallbackTimestamp,
+      importedAt,
+    }),
+    turnState: { isLoading: turnActive, isStreaming: turnActive },
+  };
+}
+
+export function parseCodexTranscript(
+  jsonl: string,
+  options: ExternalChatParseOptions,
+): ChatConversation | null {
+  return parseCodexTranscriptSnapshot(jsonl, options).conversation;
+}
+
+export function parseExternalChatTranscriptSnapshot(
+  source: ExternalChatSource,
+  jsonl: string,
+  options: ExternalChatParseOptions,
+): ExternalChatTranscriptSnapshot {
+  return source === "claude-code"
+    ? parseClaudeCodeTranscriptSnapshot(jsonl, options)
+    : parseCodexTranscriptSnapshot(jsonl, options);
 }
 
 export function parseExternalChatTranscript(
@@ -499,7 +673,5 @@ export function parseExternalChatTranscript(
   jsonl: string,
   options: ExternalChatParseOptions,
 ): ChatConversation | null {
-  return source === "claude-code"
-    ? parseClaudeCodeTranscript(jsonl, options)
-    : parseCodexTranscript(jsonl, options);
+  return parseExternalChatTranscriptSnapshot(source, jsonl, options).conversation;
 }

@@ -16,7 +16,59 @@ function keyEvent(init: KeyboardEventInit): KeyboardEvent {
 describe("in-app shortcut registry", () => {
   it("prints platform-native single-chat navigation labels", () => {
     expect(inAppShortcutLabel("new_chat", true)).toBe("⌘N");
+    expect(inAppShortcutLabel("close_tab", true)).toBe("⌘W");
+    expect(inAppShortcutLabel("close_tab", false)).toBe("Ctrl+W");
+    expect(inAppShortcutLabel("archive_chat", true)).toBe("⌘E");
+    expect(inAppShortcutLabel("archive_chat", false)).toBe("Ctrl+E");
     expect(inAppShortcutLabel("next_recent_chat", false)).toBe("Ctrl+Tab");
+  });
+
+  it("matches Cmd+W on macOS and Ctrl+W elsewhere", () => {
+    expect(
+      matchesInAppShortcut(
+        keyEvent({ key: "w", code: "KeyW", metaKey: true }),
+        "close_tab",
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      matchesInAppShortcut(
+        keyEvent({ key: "w", code: "KeyW", ctrlKey: true }),
+        "close_tab",
+        false,
+      ),
+    ).toBe(true);
+    expect(
+      matchesInAppShortcut(
+        keyEvent({ key: "w", code: "KeyW", metaKey: true, shiftKey: true }),
+        "close_tab",
+        true,
+      ),
+    ).toBe(false);
+  });
+
+  it("matches Cmd+E on macOS and Ctrl+E elsewhere", () => {
+    expect(
+      matchesInAppShortcut(
+        keyEvent({ key: "e", code: "KeyE", metaKey: true }),
+        "archive_chat",
+        true,
+      ),
+    ).toBe(true);
+    expect(
+      matchesInAppShortcut(
+        keyEvent({ key: "e", code: "KeyE", ctrlKey: true }),
+        "archive_chat",
+        false,
+      ),
+    ).toBe(true);
+    expect(
+      matchesInAppShortcut(
+        keyEvent({ key: "e", code: "KeyE", metaKey: true }),
+        "close_tab",
+        true,
+      ),
+    ).toBe(false);
   });
 
   it("requires exact modifiers so OS and app chords do not overlap", () => {

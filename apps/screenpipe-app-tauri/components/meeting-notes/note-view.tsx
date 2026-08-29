@@ -138,7 +138,10 @@ import {
 } from "./meeting-share-menu";
 import { copyMeetingSummary, emailMeetingSummary } from "./share-summary";
 import { ConnectedShareDialog } from "@/components/connected-share-dialog";
-import { createMeetingShareArtifact } from "@/lib/connected-share";
+import {
+  createMeetingShareArtifact,
+  type ConnectedShareDestination,
+} from "@/lib/connected-share";
 import {
   readRememberedShare,
   rememberedSendLabel,
@@ -162,6 +165,7 @@ import {
 } from "./meeting-summary-lifecycle";
 import { QUOTA_PLAN_LABELS } from "@/lib/chat/quota-errors";
 import { openExternalUrl } from "@/lib/open-external-url";
+import { openBusinessUpgradeSurface } from "@/lib/upgrade-flow";
 import { MeetingSummaryTransition } from "./meeting-summary-transition";
 import {
   advanceMeetingSummaryStream,
@@ -176,6 +180,7 @@ import {
   MEETING_SHELL_CLASS,
   MeetingSummarySurface,
   MeetingWorkspaceTabs,
+  stopMeetingAndOpenSummary,
   type MeetingWorkspaceTab,
 } from "./meeting-workspace";
 import { meetingRetranscribeSuccessCopy } from "./transcript-recovery-copy";
@@ -204,6 +209,12 @@ import {
   resolveActiveAiPreset,
   writeActiveAiPresetId,
 } from "@/lib/active-ai-preset";
+import { useAcpRolloutEnabled } from "@/lib/acp-rollout";
+import {
+  implicitSummaryPresetId,
+  summaryPresetModelLabel,
+  summaryPresetOptions,
+} from "./meeting-summary-presets";
 import {
   hostedAiAllowanceForModel,
   useUsageStatus,
@@ -303,6 +314,8 @@ export function NoteView({
     null,
   );
   const [shareOpen, setShareOpen] = useState(false);
+  const [requestedShareDestination, setRequestedShareDestination] =
+    useState<ConnectedShareDestination | null>(null);
   // Read once per open rather than on every render: the menu only needs to
   // name the app, and the dialog re-reads the full preference when it mounts.
   const sendLabel = useMemo(
@@ -406,7 +419,25 @@ export function NoteView({
       }),
     [attendees, meeting, note, title],
   );
-  const oneTapSend = useMeetingOneTapSend(shareArtifact);
+  // The activity bundle is already loaded for receipts and replay. Reuse it to
+  // rank connected destinations without adding another history query or moving
+  // raw window/app evidence off device.
+  const meetingShareEvidence = useMemo(() => {
+    const activity = meetingCtx?.activity;
+    if (!activity) return [];
+    return [
+      ...activity.apps.map((app) => app.name),
+      ...activity.windows.flatMap((window) => [
+        window.app_name,
+        window.window_name,
+        window.browser_url,
+      ]),
+    ].filter(Boolean);
+  }, [meetingCtx?.activity]);
+  const oneTapSend = useMeetingOneTapSend(
+    shareArtifact,
+    meetingShareEvidence,
+  );
 
   /**
    * The press is the confirmation, so the receipt has to be unmissable.
@@ -430,26 +461,26 @@ export function NoteView({
   }, [oneTapSend, toast]);
 
   const summaryPipeSlug = settings.meetingSummaryPipeSlug || "meeting-summary";
-  const summaryPresets = useMemo(() => {
-    const nonAgentPresets = settings.aiPresets.filter(
-      (preset) => preset.provider !== "acp",
-    );
-    if (!isManagedDeployment) return nonAgentPresets;
-    return filterPresetsForEnterprisePolicy(
-      nonAgentPresets,
-      enterprisePolicy.aiPresetPolicy ??
-        DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
-    );
-  }, [
-    enterprisePolicy.aiPresetPolicy,
-    isManagedDeployment,
-    settings.aiPresets,
-  ]);
-  const defaultSummaryPresetId = useMemo(
+  // The picker offers ACP presets behind the same rollout gate as the rest of
+  // the ACP UI, and falls back to a pipe-compatible model. Both rules live in
+  // meeting-summary-presets.ts, next to their tests.
+  const acpEnabled = useAcpRolloutEnabled();
+  const summaryPresets = useMemo(
     () =>
-      summaryPresets.find((preset) => preset.defaultPreset)?.id ??
-      summaryPresets[0]?.id ??
-      null,
+      summaryPresetOptions(settings.aiPresets, {
+        acpEnabled,
+        isManagedDeployment,
+        aiPresetPolicy: enterprisePolicy.aiPresetPolicy,
+      }),
+    [
+      acpEnabled,
+      enterprisePolicy.aiPresetPolicy,
+      isManagedDeployment,
+      settings.aiPresets,
+    ],
+  );
+  const defaultSummaryPresetId = useMemo(
+    () => implicitSummaryPresetId(summaryPresets),
     [summaryPresets],
   );
   const summaryPresetId = summaryPresetReady
@@ -481,7 +512,7 @@ export function NoteView({
 
   const handleSummaryPresetSelect = useCallback(
     async (preset: AIPreset | null) => {
-      if (!preset || summaryPresetSaving) return;
+      if (!preset || summaryPresetSaving) return false;
       const previousPresetIds = summaryPresetIds;
       const optimisticPresetIds = [
         preset.id,
@@ -502,6 +533,7 @@ export function NoteView({
           pipe_slug: summaryPipeSlug,
           provider: preset.provider,
         });
+        return true;
       } catch (error) {
         setSummaryPresetIds(previousPresetIds);
         console.error("failed to save meeting summary model", error);
@@ -510,6 +542,7 @@ export function NoteView({
           description: "your previous model is still selected.",
           variant: "destructive",
         });
+        return false;
       } finally {
         setSummaryPresetSaving(false);
       }
@@ -1238,7 +1271,7 @@ export function NoteView({
           });
         }
       }
-      await onStop();
+      await stopMeetingAndOpenSummary(onStop, setActiveTab);
     } catch (err) {
       console.error("failed to stop meeting", err);
       toast({
@@ -1684,9 +1717,15 @@ export function NoteView({
       };
     }
     if (visibleSummaryLifecycle.kind === "failed") {
+      const failure = meetingSummaryFailure(visibleSummaryLifecycle.execution);
       return {
-        title: "summary needs attention",
-        detail: meetingSummaryFailure(visibleSummaryLifecycle.execution).copy,
+        // "Nothing to summarize" is a factual outcome, not something the user
+        // needs to fix — keep "needs attention" for actionable failures only.
+        title:
+          failure.kind === "nothing_to_summarize"
+            ? "nothing to summarize"
+            : "summary needs attention",
+        detail: failure.copy,
       };
     }
     return {
@@ -1697,10 +1736,35 @@ export function NoteView({
           : "notes and transcript saved locally",
     };
   })();
-  const summaryUpgrade =
+  const summaryFailure =
     visibleSummaryLifecycle.kind === "failed"
-      ? meetingSummaryFailure(visibleSummaryLifecycle.execution).upgrade
+      ? meetingSummaryFailure(visibleSummaryLifecycle.execution)
       : null;
+  const summaryUpgrade = summaryFailure?.upgrade ?? null;
+  const handleSummaryUpgrade = useCallback(async () => {
+    if (!summaryUpgrade) return;
+    posthog.capture("meeting_summary_upgrade_clicked", {
+      source: "meeting-summary-limit",
+      target_plan: summaryUpgrade.requiredPlan,
+    });
+    try {
+      // The native account surface owns the common Basic → Business offer.
+      // Higher tiers and Basic have gateway-owned billing URLs whose exact
+      // target cannot be represented by that one offer card.
+      if (summaryUpgrade.requiredPlan === "business") {
+        await openBusinessUpgradeSurface("meeting-summary-limit");
+      } else {
+        await openExternalUrl(summaryUpgrade.upgradeUrl);
+      }
+    } catch (error) {
+      console.error("failed to open meeting summary upgrade", error);
+      toast({
+        title: "couldn't open upgrade options",
+        description: "try again from Settings → Account.",
+        variant: "destructive",
+      });
+    }
+  }, [summaryUpgrade, toast]);
   // Notes and Summary now own their summary lifecycle in the reading area.
   // Repeating the same state in the footer made the page look like two jobs
   // were running. Transcript still gets the global footer because it has no
@@ -2014,10 +2078,11 @@ export function NoteView({
   }, [meeting.meeting_start, meeting.meeting_end]);
   const summarySurfaceState = summaryWorking
     ? "working"
-    : visibleSummaryLifecycle.kind === "completed"
-      ? "ready"
-      : visibleSummaryLifecycle.kind === "failed"
-        ? "attention"
+    : visibleSummaryLifecycle.kind === "failed"
+      ? "attention"
+      : visibleSummaryLifecycle.kind === "completed" ||
+          extractMeetingSummary(note)
+        ? "ready"
         : "idle";
 
   // Every meeting action hangs off the single `⋯` menu on the tab rule.
@@ -2043,12 +2108,12 @@ export function NoteView({
       submenu: {
         selectedKey: summaryPresetId,
         selectedLabel: summaryPresetReady
-          ? summaryPreset?.model ?? "select"
+          ? summaryPresetModelLabel(summaryPreset) || "select"
           : "loading…",
         options: summaryPresets.map((preset) => ({
           key: preset.id,
           label: preset.id,
-          detail: preset.model,
+          detail: summaryPresetModelLabel(preset),
           onSelect: () => void handleSummaryPresetSelect(preset),
         })),
       },
@@ -2160,8 +2225,12 @@ export function NoteView({
     <div ref={rootRef} className="relative flex h-full flex-col bg-background">
       <ConnectedShareDialog
         open={shareOpen}
-        onOpenChange={setShareOpen}
+        onOpenChange={(open) => {
+          setShareOpen(open);
+          if (!open) setRequestedShareDestination(null);
+        }}
         artifact={shareArtifact}
+        initialDestination={requestedShareDestination}
       />
       {meetingConfirmations}
       {isDraggingImage && (
@@ -2306,6 +2375,7 @@ export function NoteView({
                   });
                 }}
                 resendLabel={oneTapSend.label ?? undefined}
+                suggestedDestinations={oneTapSend.suggestions}
                 onShare={(action) => {
                   posthog.capture("meeting_share_action", {
                     action,
@@ -2318,9 +2388,23 @@ export function NoteView({
                   if (action === "summary") void handleCopySummary();
                   else if (action === "email") void handleEmailSummary();
                   else if (action === "transcript") void handleCopyTranscript();
-                  else if (action === "send") setShareOpen(true);
+                  else if (action === "send") {
+                    setRequestedShareDestination(null);
+                    setShareOpen(true);
+                  }
                   else if (action === "resend") void handleOneTapSend();
                   else void handleCopy();
+                }}
+                onDestinationSelect={(destination) => {
+                  const suggestion = oneTapSend.suggestions.find(
+                    (item) => item.destination === destination,
+                  );
+                  posthog.capture("meeting_share_destination_clicked", {
+                    destination,
+                    observed_in_meeting: suggestion?.observed === true,
+                  });
+                  setRequestedShareDestination(destination);
+                  setShareOpen(true);
                 }}
               />
               </>
@@ -2359,7 +2443,9 @@ export function NoteView({
               key={meeting.id}
               value={note}
               onChange={setNote}
-              placeholder={'write notes, or type "/" for blocks'}
+              placeholder={
+                'write what matters — it helps focus the summary · "/" for blocks'
+              }
               readOnly={summaryWorking}
               summaryRevealKey={summaryRevealKey}
               className={cn(
@@ -2405,6 +2491,53 @@ export function NoteView({
               !retranscribing &&
               !summaryPresetSaving
             }
+            recovery={
+              summaryFailure
+                ? {
+                    title: summaryFailure.title,
+                    detail: summaryFailure.copy,
+                    retryable: summaryFailure.retryable,
+                    upgrade: summaryUpgrade
+                      ? {
+                          label: `upgrade to ${QUOTA_PLAN_LABELS[
+                            summaryUpgrade.requiredPlan
+                          ].toLowerCase()}`,
+                          onSelect: () => void handleSummaryUpgrade(),
+                        }
+                      : undefined,
+                    model: summaryFailure.changeModelRecommended
+                      ? {
+                          selectedId: summaryPresetId,
+                          selectedLabel: summaryPreset
+                            ? `${summaryPreset.id} · ${summaryPreset.model}`
+                            : "no summary model selected",
+                          saving: summaryPresetSaving,
+                          options: summaryPresets
+                            .filter((preset) => preset.id !== summaryPresetId)
+                            .map((preset) => ({
+                              id: preset.id,
+                              label: preset.id,
+                              detail: `${preset.provider.replace(/-/g, " ")} · ${preset.model}`,
+                              onSelect: () => {
+                                void (async () => {
+                                  const changed =
+                                    await handleSummaryPresetSelect(preset);
+                                  if (changed) await handleSummarize();
+                                })();
+                              },
+                            })),
+                          onManage: () => {
+                            window.dispatchEvent(
+                              new CustomEvent("open-settings", {
+                                detail: { section: "ai" },
+                              }),
+                            );
+                          },
+                        }
+                      : undefined,
+                  }
+                : undefined
+            }
             // Mounted with the tab rather than always: the strip pulls the
             // meeting's transcript rows and frame samples, and opening a
             // meeting to read notes or the transcript should not pay for
@@ -2441,6 +2574,9 @@ export function NoteView({
       {chatOpen && (
         <MeetingChatPanel
           conditions={chatConditions}
+          meetingTitle={title}
+          meetingStart={meeting.meeting_start}
+          meetingEnd={meeting.meeting_end}
           turns={meetingChat.turns}
           draft={chatDraft}
           onDraftChange={setChatDraft}
@@ -2578,9 +2714,7 @@ export function NoteView({
                         type="button"
                         data-testid="meeting-summary-upgrade-link"
                         className="underline underline-offset-2 transition-colors hover:text-foreground"
-                        onClick={() =>
-                          void openExternalUrl(summaryUpgrade.upgradeUrl)
-                        }
+                        onClick={() => void handleSummaryUpgrade()}
                       >
                         upgrade to{" "}
                         {QUOTA_PLAN_LABELS[

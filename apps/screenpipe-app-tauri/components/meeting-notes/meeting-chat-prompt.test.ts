@@ -53,6 +53,23 @@ describe("buildMeetingChatPrompt", () => {
     expect(buildMeetingChatPrompt(context, "q", [])).toContain("3:34");
   });
 
+  it("keeps the meeting primary but permits explicit bounded history searches", () => {
+    const prompt = buildMeetingChatPrompt(
+      context,
+      "check my screenpipe data for ten related demos",
+      [],
+    );
+    expect(prompt).toContain("broader screenpipe history");
+    // Deliberately not a tool id: the same tool is named `search-content`,
+    // `mcp__screenpipe__search-content`, or `keyword_search` depending on the
+    // backend, and naming one spelling told ACP agents to call a tool that does
+    // not exist for them.
+    expect(prompt).toContain("read-only screenpipe search and meeting tools");
+    expect(prompt).not.toContain("search-content");
+    expect(prompt).toContain("smallest relevant time range");
+    expect(prompt).toContain("Never imply broader evidence was part of this meeting");
+  });
+
   it("cases 2/16/20: discloses a transcript that is still arriving", () => {
     const settling = buildMeetingChatPrompt(
       { ...context, transcriptSettling: true },

@@ -5,8 +5,10 @@
 import { describe, it, expect } from "vitest";
 import {
   INTEGRATION_ICON_KEYS,
+  MCP_OAUTH_PROVIDERS,
   TRY_IN_CHAT_PROMPTS,
   getOAuthFallbackMessage,
+  getOAuthPanelCopy,
   isMcpOAuthProviderTileConnected,
 } from "../connections-section";
 import { connectionNameToId } from "../../../lib/utils/connection-chip";
@@ -17,7 +19,7 @@ import { connectionNameToId } from "../../../lib/utils/connection-chip";
 describe("INTEGRATION_ICON_KEYS", () => {
   it("is non-empty and includes core integrations", () => {
     expect(INTEGRATION_ICON_KEYS.size).toBeGreaterThan(0);
-    for (const id of ["slack", "google-calendar", "obsidian"]) {
+    for (const id of ["slack", "google-calendar", "obsidian", "littlebird"]) {
       expect(INTEGRATION_ICON_KEYS.has(id)).toBe(true);
     }
   });
@@ -44,8 +46,24 @@ describe("isMcpOAuthProviderTileConnected", () => {
     expect(isMcpOAuthProviderTileConnected("linear", true, { linear: false })).toBe(true);
   });
 
+  it("treats the Littlebird migration bridge as a connected MCP provider", () => {
+    expect(
+      isMcpOAuthProviderTileConnected("littlebird", false, {
+        littlebird: true,
+      }),
+    ).toBe(true);
+  });
+
   it("does not apply MCP provider state to unrelated connections", () => {
     expect(isMcpOAuthProviderTileConnected("github", false, { github: true })).toBe(false);
+  });
+});
+
+describe("MCP_OAUTH_PROVIDERS", () => {
+  it("uses Littlebird's protected MCP endpoint for the migration bridge", () => {
+    expect(MCP_OAUTH_PROVIDERS.find(({ id }) => id === "littlebird")?.url).toBe(
+      "https://mcp.littlebird.ai/mcp",
+    );
   });
 });
 
@@ -59,5 +77,21 @@ describe("getOAuthFallbackMessage", () => {
   it("shows the Zendesk pending-flow hint only for Zendesk", () => {
     expect(getOAuthFallbackMessage("zendesk", "pending")).toContain("No such client");
     expect(getOAuthFallbackMessage("slack", "pending")).toBeNull();
+  });
+});
+
+describe("getOAuthPanelCopy", () => {
+  it("frames Slack multi-connect as workspaces", () => {
+    expect(getOAuthPanelCopy("slack", "Slack")).toEqual({
+      description: "Connect a Slack workspace. Add each workspace where Screenpipe should act on your behalf.",
+      addAnotherLabel: "add another workspace",
+    });
+  });
+
+  it("keeps account language for other OAuth providers", () => {
+    expect(getOAuthPanelCopy("github", "GitHub")).toEqual({
+      description: "Connect your GitHub account. AI can act on your behalf once connected.",
+      addAnotherLabel: "add another account",
+    });
   });
 });

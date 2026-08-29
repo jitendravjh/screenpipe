@@ -146,6 +146,33 @@ describe("chat-storage bounded history", () => {
     __resetChatStorageCachesForTests();
   });
 
+  it("blocks temporary side chats at the storage and history boundary", async () => {
+    const id = "temporary-side-chat-11111111-1111-4111-8111-111111111111";
+    const conversation = {
+      id,
+      title: "temporary side chat",
+      messages: [
+        { id: "u1", role: "user", content: "private draft", timestamp: 100 },
+      ],
+      createdAt: 100,
+      updatedAt: 100,
+    };
+
+    await saveConversationFile(conversation);
+    expect(fsMock.files.size).toBe(0);
+    expect(await loadConversationFile(id)).toBeNull();
+
+    // Simulate a leaked file from a future caller that bypasses the public
+    // save API. User-facing list/search and metadata parsing still reject it.
+    putConversation(id, {
+      updatedAt: 100,
+      content: "private draft",
+    });
+    expect(conversationMetaFromJson(conversation)).toBeNull();
+    expect(await listConversations()).toEqual([]);
+    expect(await searchConversations("private draft")).toEqual([]);
+  });
+
   it("loads only the newest 50 conversation files for the default history view", async () => {
     for (let i = 0; i < 60; i += 1) {
       putConversation(`chat-${i}`, { updatedAt: i + 1 });
@@ -298,6 +325,29 @@ describe("chat-storage bounded history", () => {
     expect(conv?.lastViewedAt).toBe(150);
     expect(meta?.lastViewedAt).toBe(150);
     expect(meta?.lastContentAt).toBe(200);
+  });
+
+  it("preserves imported agent provenance in conversation metadata", () => {
+    const meta = conversationMetaFromJson({
+      id: "imported-codex-thread",
+      title: "agent task",
+      createdAt: 100,
+      updatedAt: 200,
+      messages: [{ id: "u1", role: "user", content: "hello", timestamp: 100 }],
+      importedFrom: {
+        source: "codex",
+        sourceId: "thread-1",
+        importedAt: 300,
+        harness: "cursor",
+      },
+    });
+
+    expect(meta?.importedFrom).toEqual({
+      source: "codex",
+      sourceId: "thread-1",
+      importedAt: 300,
+      harness: "cursor",
+    });
   });
 
   it("re-throws and reports when the disk write fails (forbidden path, #5306)", async () => {

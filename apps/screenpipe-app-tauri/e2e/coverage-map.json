@@ -235,6 +235,18 @@
       ]
     },
     {
+      "id": "chat-coding-worktrees",
+      "label": "Conversation-owned coding worktrees",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai"
+      ]
+    },
+    {
       "id": "tray-search",
       "label": "Tray/search window behavior",
       "platforms": [
@@ -337,13 +349,14 @@
         "agent-cancellation",
         "agent-terminal",
         "agent-tool-metadata",
+        "agent-tool-compaction",
         "mcp-registration",
         "process-supervision"
       ],
       "criticality": "high",
       "confidence": "partial",
       "ux": "mixed",
-      "notes": "Official Rust ACP SDK runtime and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, exact adapter/descendant reaping, terminal lifecycle/output draining, late tool metadata/error propagation with a provider fallback, and a real authenticated local API MCP health call. Curated third-party adapters remain manual smoke coverage."
+      "notes": "Official Rust ACP SDK runtime and inline UI E2E with a deterministic stdio agent: initialization, session close, streaming, background permissions, cancellation, localized auth/cancel, malformed stdout, exact adapter/descendant reaping, terminal lifecycle/output draining, late tool metadata/error propagation with a provider fallback, progressive compaction of repeated Claude tool calls with drill-down access, and a real authenticated local API MCP health call. Curated third-party adapters remain manual smoke coverage."
     },
     {
       "spec": "acp-onboarding-ux.spec.ts",
@@ -647,7 +660,8 @@
       ],
       "layers": [
         "chat-ai",
-        "real-ui-e2e"
+        "tauri-command",
+        "window-lifecycle"
       ],
       "features": [
         "chat",
@@ -680,6 +694,25 @@
       "confidence": "partial",
       "ux": "real-user-flow",
       "notes": "The Day Recap automation card previews its user-facing prompt in the empty composer on hover, restores the default placeholder on leave, and creates exactly one persisted conversation and one sidebar row; status-only activity for an unknown session must not create an empty untitled sibling."
+    },
+    {
+      "spec": "chat-coding-worktree.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat"
+      ],
+      "criticality": "high",
+      "confidence": "conditional",
+      "ux": "real-user-flow",
+      "notes": "Temporarily quarantined while the composer worktree opt-in is hidden. The retained workflow fixture covers AI repository routing, dirty-source preservation, conversation isolation and resume, worktree identity, Pi cwd ownership, hostile extension isolation, and stop recovery when the control is restored; it does not currently contribute critical worktree coverage."
     },
     {
       "spec": "chat-composer-isolation.spec.ts",
@@ -718,6 +751,27 @@
       "confidence": "partial",
       "ux": "synthetic",
       "notes": "QUARANTINED (#4689): connections-context wrapper stripping regression. The synthetic background-router event path never persists deterministically on Linux/macOS CI; re-enable once it drives a deterministic persisted session."
+    },
+    {
+      "spec": "chat-context-usage-providers.spec.ts",
+      "platforms": [
+        "macos"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e",
+        "tauri-command"
+      ],
+      "features": [
+        "chat",
+        "context-usage",
+        "acp-backend",
+        "agent-streaming"
+      ],
+      "criticality": "medium",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "The composer's context reading, once per harness class that can report one. Native Pi answers a real OpenAI-compatible turn whose stream carries usage, and the project-local context-usage extension publishes a per-category breakdown that must sum to the model's own total and must keep non-empty rules/skills buckets, which is what guards the classifier's coupling to pi's prompt section markers. A deterministic stdio ACP adapter reports only the protocol usage_update pair and must render one bar plus the line saying no breakdown is available. Also covers the pre-first-turn state, where the panel says nothing rather than estimating."
     },
     {
       "spec": "chat-cost-limit-upgrade.spec.ts",
@@ -776,7 +830,47 @@
       "criticality": "medium",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "A real Tauri chat session keeps a short answer at the top of the message rail without exposing a false new-content state."
+      "notes": "A real Tauri chat session keeps a short answer at the top of the message rail without exposing an interactive jump-to-latest control."
+    },
+    {
+      "spec": "chat-renderer-reload-hydration.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "window-lifecycle",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "window-lifecycle"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "mixed",
+      "notes": "A real Tauri WebView loads two saved transcripts, survives a full renderer reload, switches between them repeatedly without refetching connections, then repeats the same-id route and proves both message rows remain rendered."
+    },
+    {
+      "spec": "chat-jump-to-latest.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat"
+      ],
+      "criticality": "medium",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "A long real Tauri chat fades a quiet composer-anchored jump control at the latest message, reveals it after scrolling up, and returns to the bottom on click."
     },
     {
       "spec": "chat-hosted-retry-feedback.spec.ts",
@@ -795,7 +889,28 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "A local provider returns priced_request_in_flight twice; Pi retries while the UI remains active, a real composer follow-up enters the Rust queue, and both turns recover without the misleading mid-response error."
+      "notes": "A local provider returns priced_request_in_flight twice; Pi retries while the turn row exposes its bounded retry attempt, a real composer follow-up enters the Rust queue, and both turns recover without the misleading mid-response error."
+    },
+    {
+      "spec": "chat-turn-liveness.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "chat-streaming",
+        "offline-recovery"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "The real desktop chat turns off its active phosphor signal and explains that a message is saved when WebView connectivity drops, restores active state on reconnect, and exposes a silent harness after the bounded no-event deadline."
     },
     {
       "spec": "chat-inline-charts.spec.ts",
@@ -816,6 +931,30 @@
       "confidence": "strong",
       "ux": "real-user-flow",
       "notes": "Seeds an assistant message containing ```chart fences and asserts the charts render inline between the surrounding paragraphs, bar widths are proportional to the data, hover shows a tooltip and recolours the mark, a malformed fence degrades to a readable code block, every chart exposes a screen-reader table, and no chart uses a rounded corner (DESIGN.md)."
+    },
+    {
+      "spec": "chat-rich-result-cards.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e",
+        "tauri-command"
+      ],
+      "features": [
+        "chat",
+        "chat-results",
+        "pipes",
+        "artifacts",
+        "live-views"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Seeds durable scheduled-task, artifact, chat, Live View, and link results; proves directives stay hidden, all proposed/pending/success/paused/recovery states render truthfully, non-actionable states disable Open, light/dark review screenshots remain usable, and a created-chat card switches through the real Tauri conversation handoff."
     },
     {
       "spec": "chat-local-ai-gateway.spec.ts",
@@ -917,6 +1056,29 @@
       "notes": "The real new-chat shortcut opens a fresh chat from non-empty conversations and reuses one blank chat when pressed repeatedly."
     },
     {
+      "spec": "chat-overlapping-switch-isolation.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e",
+        "window-lifecycle"
+      ],
+      "features": [
+        "chat",
+        "chat-context",
+        "chat-navigation",
+        "chat-session-activity"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "mixed",
+      "notes": "Two native chat-load events overlap while the Home panel still renders the outgoing transcript; the newest navigation wins and reopening plus persisting the intermediate chat preserves its own title, identity, and message ids."
+    },
+    {
       "spec": "chat-parallel-jobs-duplicate.spec.ts",
       "platforms": [
         "windows",
@@ -1010,6 +1172,29 @@
       "notes": "Opening the standalone Settings route mid-stream must not abort the chat: a long synthetic stream keeps running while the user round-trips to Settings, remains live in Recents, and restores the full response (early + final tokens) after the row is clicked."
     },
     {
+      "spec": "chat-agent-activity-sidebar.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "chat-sidebar-groups",
+        "chat-unread-state",
+        "chat-structured-output",
+        "chat-turn-status"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Recent local Codex and Claude histories sync automatically into the same Recents stream as native Screenpipe chats. Isolated real JSONL files prove that a background provider update does not invent an unread dot when the transcript has no provider attention state, that an opened provider chat shows live thinking and running tool feedback, and that tool completion plus later assistant text arrive without a page reload for both providers. A large Claude JSON response stays compact by default and expands into readable, pretty-printed output. The primary sidebar has no import action; right-clicking View all filters by only the sources present, while a hover-only organizer exposes the same filters plus source grouping and priority or latest-update sorting. Captures sparse, crowded mixed-provider, Codex-heavy, and structured-output native UI states with one harness icon per row, expanded pinned rows, and the capped recent working set."
+    },
+    {
       "spec": "chat-sidebar-groups.spec.ts",
       "platforms": [
         "windows",
@@ -1049,7 +1234,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "mixed",
-      "notes": "The long chat inventory scrolls independently; a collapsed Pipes section loads nothing, expanding it lists a compact execution-backed activity page, expanding a pipe lazily loads its newest 10 executions, and older runs paginate on demand."
+      "notes": "The long chat inventory scrolls independently; a collapsed Automations section loads nothing, expanding it lists a compact execution-backed activity page, expanding an automation lazily loads its newest 10 executions, older runs paginate on demand, and a pinned automation remains archived after reload."
     },
     {
       "spec": "chat-sidebar-repeated-prompt.spec.ts",
@@ -1091,6 +1276,92 @@
       "notes": "Listener-order regression for metadata-only sidebar stubs gaining dedup keys."
     },
     {
+      "spec": "chat-right-panel-tabs.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "right-panel-tabs",
+        "file-preview"
+      ],
+      "criticality": "medium",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Multiple file previews stay open in the chat right panel, preserve selection across hide and show, and close with predictable focus fallback."
+    },
+    {
+      "spec": "chat-selected-text-side-chat.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "selected-text-actions",
+        "side-chat"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Selecting rendered assistant text exposes the current-chat and temporary side-chat actions. Add to chat keeps the active conversation; ask in side chat creates an editable unsent composer on the right while its source remains visible on the left. Sent side-chat content stays absent from Recents and disk, nested side chats are unavailable, replacement removes the old temporary session, and close restores the source without an orphan pane."
+    },
+    {
+      "spec": "chat-workspace-tabs.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "chat",
+        "chat-tabs",
+        "chat-split-pane",
+        "owned-browser",
+        "browser-session-consent",
+        "right-panel-tabs"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Native pointer clicks reach tabs, close, and new-chat controls above the window drag region; unused mount placeholders do not create extra untitled tabs. Multiple real chats remain in a non-destructive working set, a second live transcript stays visible, and promoting it swaps primary composer ownership. Back-to-back owned-browser navigation and consent events keep the login prompt visible without a false loading animation, retain the current address, and render both browser chrome rows at 36px."
+    },
+    {
+      "spec": "owned-browser-tabs.spec.ts",
+      "platforms": [
+        "windows",
+        "macos"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "owned-browser",
+        "right-panel-tabs",
+        "native-child-webviews"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "command",
+      "notes": "A surviving app window drives two native child webviews after the home automation context is replaced, then verifies retained per-tab URLs and close cleanup through the E2E harness."
+    },
+    {
       "spec": "chat-source-file-preview.spec.ts",
       "platforms": [
         "windows",
@@ -1126,6 +1397,25 @@
       "notes": "Stop on a live turn against a real Pi subprocess: abort mid-stream then send again (no ghost turn or hang), and two overlapping Stops followed by a clean send. Queue lifecycle regression for the request-id correlation refactor."
     },
     {
+      "spec": "chat-steer-continuation.spec.ts",
+      "platforms": [
+        "macos"
+      ],
+      "layers": [
+        "chat-ai",
+        "real-ui-e2e",
+        "tauri-command"
+      ],
+      "features": [
+        "chat",
+        "chat-streaming"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "A real composer Cmd+Enter steer against Pi immediately inserts a distinct active assistant continuation below the steering bubble and preserves it through the original turn's agent_end transition."
+    },
+    {
       "spec": "chat-streaming-performance.spec.ts",
       "platforms": [
         "macos"
@@ -1141,7 +1431,7 @@
       "criticality": "medium",
       "confidence": "conditional",
       "ux": "performance",
-      "notes": "macOS-only chat streaming responsiveness."
+      "notes": "macOS-only foreground and background streaming responsiveness plus live and final rich-Markdown fidelity when headings, links, tables, inline code, and fenced code are split across synthetic production-shaped chunks."
     },
     {
       "spec": "chat-stuck-queue-guard.spec.ts",
@@ -1236,6 +1526,7 @@
       ],
       "features": [
         "chat",
+        "chat-answer-rendering",
         "chat-tools",
         "mcp-startup-filtering",
         "pi-tool-activity",
@@ -1244,7 +1535,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "mixed",
-      "notes": "Mixed Python, JavaScript, Screenpipe API, file, test, recovered-error, and optional live Pi tool flows stay collapsed by default, expose only friendly activity on first expansion, and keep completed tools active while the shared Pi turn is still streaming. Synthetic MCP startup events stay out of the transcript so the answer remains primary, connection diagnostics never leak into chat, and startup failures never inflate the command rail's failure count."
+      "notes": "Mixed Python, JavaScript, Screenpipe API, file, test, recovered-error, and optional live Pi tool flows stay collapsed by default, expose only friendly activity on first expansion, and keep completed tools active while the shared Pi turn is still streaming. A completed turn preserves its last assistant answer when a tool event follows it while earlier narration stays hidden. Synthetic MCP startup events stay out of the transcript so the answer remains primary, connection diagnostics never leak into chat, and startup failures never inflate the command rail's failure count."
     },
     {
       "spec": "chat-window.spec.ts",
@@ -1265,7 +1556,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Opens Chat and focuses the composer for typing."
+      "notes": "Opens Chat and focuses the composer for typing. A chat saved from the floating window syncs into Home's Recents without becoming a second Home working tab."
     },
     {
       "spec": "chat-within-session-context-loss.spec.ts",
@@ -1325,7 +1616,7 @@
       "confidence": "partial",
       "ux": "real-user-flow",
       "tests": 4,
-      "notes": "Agent handoff beside the first-run summary: the summary stays primary and clickable whether or not an agent is offered, an offered target is never nameless or unclickable, the filesystem probe cannot break the ready banner or the summary click-through, and the paste instruction appears only after the handoff runs. Waits for the async probe before concluding absence. Does not assert WHICH agent: detectAiTools resolves the real home in the webview (SCREENPIPE_E2E_AI_TOOLS_HOME is Rust-only), so selection is host-dependent and is covered in lib/first-run/agent-handoff.test.ts and use-agent-handoff.test.ts."
+      "notes": "Agent handoff beside the first-run summary: the summary stays primary and clickable whether or not an agent is offered, an offered target is never nameless or unclickable, the filesystem probe cannot break the ready banner or the summary click-through, opening the result collapses into the compact setup dock, and the paste instruction appears only after the handoff runs. Waits for the async probe before concluding absence. Does not assert WHICH agent: detectAiTools resolves the real home in the webview (SCREENPIPE_E2E_AI_TOOLS_HOME is Rust-only), so selection is host-dependent and is covered in lib/first-run/agent-handoff.test.ts and use-agent-handoff.test.ts."
     },
     {
       "spec": "first-run-ai-summary.spec.ts",
@@ -1335,19 +1626,21 @@
       "layers": [
         "onboarding",
         "chat-ai",
+        "local-api",
         "real-ui-e2e",
         "tauri-command"
       ],
       "features": [
         "onboarding",
         "first-run-learning",
-        "chat"
+        "chat",
+        "notifications"
       ],
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "tests": 1,
-      "notes": "Opt-in hosted-AI lane for the post-setup summary: the real app starts its own Pi session through the Rust command and the production Worker under Miniflare, and the forwarded provider request is asserted to carry the screen and audio excerpts plus the browser URL, not just app names. Guards the regression where the summary was AI-written but built from containers only, so it read templated. The seeded chat must hold the model's text and never the deterministic opener."
+      "tests": 3,
+      "notes": "Opt-in hosted-AI lane for the post-setup summary: the real app starts its own Pi session through the Rust command and the production Worker under Miniflare. It proves a low-tier parsed-only fixture with one sustained app and no Timeline dependency reaches the model, accessibility evidence is used when parsed context is unavailable, and two transient activity-engine failures recover without a deterministic fallback. The seeded chat must hold the model's text and never the deterministic opener. Once ready, the real app must persist one content-free /notify entry whose primary deep link returns to the locally resolved summary and marks it opened."
     },
     {
       "spec": "first-run-guide.spec.ts",
@@ -1390,8 +1683,8 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "tests": 8,
-      "notes": "Post-setup summary on Home under the authenticated seed: immediate runs show a live countdown, empty engine results settle silently with their diagnostic reason preserved, silent states stay silent across reloads, late returns retry in the background, ready summaries remain actionable, a verified shown Chat-shortcut outcome completes the contextual practice lesson while a hidden outcome stays recoverable, and idle/done never render."
+      "tests": 9,
+      "notes": "Post-setup summary on Home under the authenticated seed: immediate runs show a live countdown, an interrupted first attempt gets exactly one quiet recovery, exhausted empty engine results settle with their diagnostic reason preserved, silent states stay silent across reloads, late returns retry in the background, ready summaries remain actionable, a verified shown Chat-shortcut outcome completes the contextual practice lesson while a hidden outcome stays recoverable, and idle/done never render."
     },
     {
       "spec": "first-run-reset-learning-window.spec.ts",
@@ -1682,6 +1975,26 @@
       "notes": "Per-app meeting-detection ignore picker: open, toggle, count badge, persistence across reopen (#3882 / #3847)."
     },
     {
+      "spec": "meeting-calendar-url-match.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "real-ui-e2e",
+        "local-api",
+        "tauri-command"
+      ],
+      "features": [
+        "meeting-calendar-association"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Runs the production calendar matcher and DB write with the reported back-to-back boundary shape: an outgoing URL-less event overlaps a target event starting in 40 seconds whose normalized Meet room exactly matches the detector URL. Verifies the persisted title and attendees, then proves the visible Meetings row uses the target rather than the outgoing event."
+    },
+    {
       "spec": "meeting-note-bottom-click.spec.ts",
       "platforms": [
         "windows",
@@ -1742,6 +2055,26 @@
       "notes": "Starts a real isolated meeting, verifies bounded snapshot plus deterministic delta/final transcript frames, and proves the stream clears on the authoritative stop edge."
     },
     {
+      "spec": "meeting-replay-player.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "real-ui-e2e",
+        "local-api"
+      ],
+      "features": [
+        "meeting-notes",
+        "meeting-replay"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Seeds four stored frames, wraps their exact timestamps in an ended meeting, reopens it from the previous-meetings list, and verifies deduped silent playback, pause stability, and a review screenshot."
+    },
+    {
       "spec": "meeting-restart-live-transcription.spec.ts",
       "platforms": [
         "windows",
@@ -1797,7 +2130,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Seeds a meeting with notes and summary, switches persistent tabs, resizes to 640x560, checks footer separation and horizontal overflow, then captures a review screenshot."
+      "notes": "Seeds a live meeting with notes and summary, proves the saved summary is the preferred outcome view, switches persistent tabs, resizes to 640x560, checks footer separation and horizontal overflow, captures a review screenshot, then stops from the transcript and verifies the Summary tab opens."
     },
     {
       "spec": "meeting-chat-panel.spec.ts",
@@ -2028,6 +2361,28 @@
       "notes": "Opens Home -> Connections, opens the first AI tools setting, verifies the common tool toggles are first and directly visible in the modal, checks plain-language built-ins and compatibility labels, filters the package search, and captures a screenshot. Read-only smoke: does not install packages."
     },
     {
+      "spec": "pii-redaction-coordination.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "real-ui-e2e",
+        "local-api",
+        "performance"
+      ],
+      "features": [
+        "app-launch",
+        "health",
+        "local-api-load"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "api",
+      "notes": "Starts the opt-in local ONNX text reconciliation worker in the desktop app, redacts a 24-row SQLite backlog, and probes WebDriver plus health responsiveness while it runs."
+    },
+    {
       "spec": "pipe-continuous-chat.spec.ts",
       "platforms": [
         "macos"
@@ -2150,6 +2505,27 @@
       "confidence": "strong",
       "ux": "real-user-flow",
       "notes": "Privacy settings reveal/copy local API key flow."
+    },
+    {
+      "spec": "privacy-first-click-settings.spec.ts",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "settings",
+        "storage-privacy",
+        "real-ui-e2e"
+      ],
+      "features": [
+        "settings-optimistic-state",
+        "settings-privacy-filters"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Delayed settings persistence proves the first click remains visible for both a category switch and a native checkbox while the store write is pending."
     },
     {
       "spec": "privacy-installed-apps.spec.ts",

@@ -51,6 +51,12 @@ import {
   synchronizedActiveTurn,
   toRuntimeMessages,
 } from "@/lib/chat/cross-window-transcript-sync";
+import {
+  isEphemeralSideConversation,
+  isEphemeralSideConversationId,
+} from "@/lib/stores/chat-store";
+import { createConversationBranch } from "@/lib/chat/branch-conversation";
+import { showChatArchiveUndoToast } from "@/components/chat/archive-undo-toast";
 
 // --- Hook options ---
 
@@ -201,6 +207,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // Run migration from store.bin on mount, then load conversations from files
   const migrationDoneRef = useRef(false);
   const historyRequestRef = useRef(0);
+  // Conversation loads can overlap when two tab/sidebar events arrive before
+  // the first disk read finishes. Only the newest navigation may commit panel
+  // state; older loads may otherwise finish last and move the UI backwards.
+  const loadConversationRequestRef = useRef(0);
   const lastHistoryQueryRef = useRef<string | null>(null);
   const [historyReady, setHistoryReady] = useState(false);
   const historyRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -623,9 +633,6 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   ) => {
     if (msgs.length === 0) return;
 
-    const historyEnabled = settings?.chatHistory?.historyEnabled ?? true;
-    if (!historyEnabled) return;
-
     // Bind the save to `conversationId` (React state), NOT
     // `piSessionIdRef.current` (a ref). The ref is updated eagerly inside
     // loadConversation — `piSessionIdRef.current = conv.id` runs before
@@ -659,6 +666,22 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       piSessionIdRef.current ||
       useChatStore.getState().currentId;
     if (!convId) return;
+
+    // Temporary side conversations live only in the session store. Check the
+    // id registry as well as the live record: closing a side chat can remove
+    // its record while a debounced save from the previous render is still
+    // queued. In that race, the tombstone keeps the late callback off disk.
+    const chatState = useChatStore.getState();
+    if (isEphemeralSideConversationId(chatState, convId)) {
+      if (chatState.sessions[convId]) {
+        chatState.actions.setMessages(convId, msgs as any);
+        chatState.actions.patch(convId, { draft: false });
+      }
+      return;
+    }
+
+    const historyEnabled = settings?.chatHistory?.historyEnabled ?? true;
+    if (!historyEnabled) return;
 
     // Try to load existing conversation to preserve createdAt + title + kind.
     const { loadConversationFile } = await import("@/lib/chat-storage");
@@ -1225,9 +1248,30 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   //      tokens). Fall back to disk only when the store is cold for
   //      this id.
   const loadConversation = async (conv: ChatConversation | ConversationMeta) => {
+    const requestId = ++loadConversationRequestRef.current;
+    const isLatestRequest = () =>
+      loadConversationRequestRef.current === requestId;
     const { useChatStore } = await import("@/lib/stores/chat-store");
+    if (!isLatestRequest()) return;
     const store = useChatStore.getState();
-    const outgoingSid = piSessionIdRef.current;
+
+    // Closing a temporary side chat leaves a session-lifetime tombstone. A
+    // delayed tab/split event must not recreate that id as a normal session or
+    // steal foreground ownership after the user has already closed it.
+    if (
+      !store.sessions[conv.id] &&
+      isEphemeralSideConversationId(store, conv.id)
+    ) {
+      return;
+    }
+
+    // `piSessionIdRef` moves eagerly to the requested chat, while React's
+    // `messages` and `conversationId` still describe the rendered chat until
+    // the load commits. A second load in that window must snapshot the panel
+    // under the rendered id, not the first request's eager ref.
+    const outgoingSid =
+      currentConversationIdRef.current || piSessionIdRef.current;
+    const outgoingMessages = currentMessagesRef.current;
     const viewedAt = Date.now();
 
     // (1) Snapshot OUTGOING session — atomic so router writes that
@@ -1242,7 +1286,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       const outgoingKind = store.sessions[outgoingSid].kind;
       if (outgoingKind !== "pipe-watch") {
         store.actions.snapshotSession(outgoingSid, {
-          messages: messages as any,
+          messages: outgoingMessages as any,
           streamingText: piStreamingTextRef.current,
           streamingMessageId: piMessageIdRef.current,
           contentBlocks: [...piContentBlocksRef.current],
@@ -1312,17 +1356,23 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     //     disk would silently drop tokens that arrived since the last
     //     persisted agent_end.
     const existing = store.sessions[conv.id];
+    const incomingIsEphemeralSideChat =
+      isEphemeralSideConversation(existing) ||
+      isEphemeralSideConversationId(store, conv.id);
     const needsPersistedSync =
-      !existing ||
-      !existing.hydratedAt ||
-      !existing.messages ||
-      existing.messages.length === 0 ||
-      existing.titleSource == null;
+      !incomingIsEphemeralSideChat &&
+      (!existing ||
+        !existing.hydratedAt ||
+        !existing.messages ||
+        existing.messages.length === 0 ||
+        existing.titleSource == null);
     let persisted: ChatConversation | null = null;
 
     if (needsPersistedSync) {
       const { loadConversationFile } = await import("@/lib/chat-storage");
+      if (!isLatestRequest()) return;
       persisted = await loadConversationFile(conv.id);
+      if (!isLatestRequest()) return;
       // Seed the prior ACP session id so the first cold-start spawn for this
       // reopened chat reattaches (session/resume) instead of starting fresh.
       const priorAcpSessionId =
@@ -1499,12 +1549,22 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       store.actions.markHydrated(conv.id);
     }
     store.actions.patch(conv.id, { lastViewedAt: viewedAt });
-    try {
-      await updateConversationFlags(conv.id, { lastViewedAt: viewedAt });
-    } catch {
-      // Best-effort: unread clears live immediately; the next full save can
-      // still persist the watermark if this patch fails.
+    const isEphemeralSideChat =
+      incomingIsEphemeralSideChat ||
+      isEphemeralSideConversationId(useChatStore.getState(), conv.id);
+    if (!isEphemeralSideChat) {
+      try {
+        await updateConversationFlags(conv.id, { lastViewedAt: viewedAt });
+      } catch {
+        // Best-effort: unread clears live immediately; the next full save can
+        // still persist the watermark if this patch fails.
+      }
     }
+
+    // A newer tab/sidebar event arrived while this request was reading disk or
+    // updating metadata. Its eager session ref already owns the foreground;
+    // do not let this older request overwrite the panel when it resumes.
+    if (!isLatestRequest()) return;
 
     setMessages(messagesForPanel);
     setConversationId(conv.id);
@@ -1533,29 +1593,36 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }
     }
 
-    // Update activeConversationId in store
-    try {
-      const { getStore } = await import("@/lib/hooks/use-settings");
-      const store = await getStore();
-      const freshSettings = await store.get<any>("settings");
-      if (freshSettings?.chatHistory) {
-        await store.set("settings", {
-          ...freshSettings,
-          chatHistory: {
-            ...freshSettings.chatHistory,
-            activeConversationId: conv.id,
-          }
-        });
-        await store.save();
+    // A temporary side chat must not become the launch-time restore target.
+    // Keep the durable source conversation as activeConversationId instead.
+    if (!isEphemeralSideChat) {
+      try {
+        const { getStore } = await import("@/lib/hooks/use-settings");
+        if (!isLatestRequest()) return;
+        const store = await getStore();
+        if (!isLatestRequest()) return;
+        const freshSettings = await store.get<any>("settings");
+        if (!isLatestRequest()) return;
+        if (freshSettings?.chatHistory) {
+          await store.set("settings", {
+            ...freshSettings,
+            chatHistory: {
+              ...freshSettings.chatHistory,
+              activeConversationId: conv.id,
+            }
+          });
+          if (!isLatestRequest()) return;
+          await store.save();
+        }
+      } catch (e) {
+        console.warn("Failed to update active conversation:", e);
       }
-    } catch (e) {
-      console.warn("Failed to update active conversation:", e);
     }
 
     // Emit the preset ID so the chat panel can restore the model selection.
     // This ensures the model selector reflects the preset used in this chat.
     const presetId = persisted?.presetId ?? (conv as ChatConversation).presetId;
-    if (presetId) {
+    if (presetId && isLatestRequest()) {
       try {
         await emit("chat-preset-restore", { presetId });
       } catch {
@@ -1592,60 +1659,16 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }
     }
 
-    const newId = crypto.randomUUID();
     const currentTitle = store.sessions[outgoingSid]?.title?.trim();
-    const title = currentTitle || "Branched Chat";
     const branchedFrom = outgoingSid || conversationId || undefined;
-    const createdAt = Date.now();
-    const lastUserMessageAt = [...branchedMessages]
-      .reverse()
-      .find((m) => m.role === "user")?.timestamp;
-
-    const conversation: ChatConversation = {
-      id: newId,
-      title,
-      messages: branchedMessages.slice(-100).map((m) => {
-        let content = m.content;
-        if (!content && m.contentBlocks?.length) {
-          content = m.contentBlocks
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text)
-            .join("\n");
-        }
-        const blocks = m.contentBlocks?.map((b: any) => {
-          if (b.type === "tool") {
-            const { isRunning, ...rest } = b.toolCall;
-            return { type: "tool", toolCall: { ...rest, isRunning: false, result: rest.result?.slice(0, 4000) } };
-          }
-          if (b.type === "thinking") return { ...b, isThinking: false };
-          return b;
-        });
-        return {
-          id: m.id,
-          role: m.role,
-          content,
-          ...(m.intent ? { intent: m.intent } : {}),
-          ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
-          timestamp: m.timestamp,
-          ...(m.displayContent ? { displayContent: m.displayContent } : {}),
-          ...(blocks?.length ? { contentBlocks: blocks } : {}),
-          ...(m.images?.length ? { images: m.images } : {}),
-          ...((m as any).attachments?.length ? { attachments: (m as any).attachments } : {}),
-          ...(m.model ? { model: m.model } : {}),
-          ...(m.provider ? { provider: m.provider } : {}),
-          ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
-          ...(m.steeredResponse ? { steeredResponse: true } : {}),
-          ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
-          ...(m.stoppedByUser ? { stoppedByUser: true } : {}),
-        };
-      }),
-      createdAt,
-      updatedAt: createdAt,
-      ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
-      // Exempts the fork from the first-user-message dedup, which would
-      // otherwise collapse it into the parent it was branched from.
-      ...(branchedFrom ? { branchedFrom } : {}),
-    };
+    if (!branchedFrom) return;
+    const conversation = createConversationBranch({
+      sourceId: branchedFrom,
+      title: currentTitle,
+      messages: branchedMessages,
+    });
+    if (!conversation) return;
+    const newId = conversation.id;
 
     await saveConversationFile(conversation);
     await refreshFileConversations();
@@ -1721,7 +1744,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // chat agree from message 0). Passing one avoids the
   // generate-then-overwrite dance which left store.currentId pointing
   // at the throwaway uuid.
-  const startNewConversation = async (explicitId?: string) => {
+  const startNewConversation = async (
+    explicitId?: string,
+    options: { sideConversationParentId?: string } = {},
+  ) => {
     // Snapshot OUTGOING session into the store so the previous chat's
     // in-flight state survives the switch to "new chat". Without this,
     // hitting "+ new chat" in the middle of a stream would silently
@@ -1750,6 +1776,20 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
         });
       }
+    }
+
+    // Leaving a temporary side conversation for a brand-new durable chat ends
+    // the side-chat lifecycle. Abort its process, remove its tab/transcript,
+    // and clear the split while retaining the store's id tombstone so any late
+    // autosave remains a no-op.
+    if (
+      outgoingSid &&
+      !options.sideConversationParentId &&
+      isEphemeralSideConversation(store.sessions[outgoingSid])
+    ) {
+      commands.piAbort(outgoingSid).catch(() => {});
+      store.actions.drop(outgoingSid);
+      store.actions.setSplitChat(null);
     }
 
     // Clear panel state
@@ -1796,7 +1836,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       const now = Date.now();
       store.actions.upsert({
         id: newSid,
-        title: "untitled",
+        title: options.sideConversationParentId
+          ? "temporary side chat"
+          : "untitled",
         preview: "",
         status: "idle",
         messageCount: 0,
@@ -1806,6 +1848,13 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         unread: false,
         draft: true,
         messages: [],
+        ...(options.sideConversationParentId
+          ? {
+              ephemeral: true,
+              sideConversation: true,
+              sideConversationParentId: options.sideConversationParentId,
+            }
+          : {}),
       });
     }
     piSessionIdRef.current = newSid;
@@ -1826,13 +1875,30 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // The chat-title menu uses Archive as its safe primary history action.
   // Permanent deletion remains available from the sidebar row menu, where
   // the conversation being acted on is explicit and a confirmation follows.
+  // Close the tab as part of archive. Sibling tabs stay the resume path;
+  // mint a new chat only when this was the last open tab and the tab strip
+  // is not already going to recover via ⌘W's closer.
   const archiveConversation = async (convId: string) => {
-    await updateConversationFlags(convId, { hidden: true });
-    commands.piAbort(convId).catch(() => {});
-
-    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const { fallbackOpenChatId, useChatStore } = await import(
+      "@/lib/stores/chat-store"
+    );
+    const { hasRegisteredChatTabCloser } = await import(
+      "@/lib/close-tab-shortcut"
+    );
     const store = useChatStore.getState();
-    store.actions.patch(convId, { hidden: true, unread: false });
+    const wasCurrent =
+      conversationId === convId || piSessionIdRef.current === convId;
+    const fallbackId = fallbackOpenChatId(store, convId);
+    const wasPinned = store.sessions[convId]?.pinned ?? false;
+
+    await updateConversationFlags(convId, { hidden: true, pinned: false });
+    commands.piAbort(convId).catch(() => {});
+    store.actions.patch(convId, {
+      hidden: true,
+      pinned: false,
+      unread: false,
+    });
+    store.actions.closeChat(convId);
     await refreshFileConversations();
 
     try {
@@ -1842,7 +1908,51 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       // repair itself on its next disk hydration.
     }
 
-    if (conversationId === convId || piSessionIdRef.current === convId) {
+    showChatArchiveUndoToast({
+      onUndo: async () => {
+        await updateConversationFlags(convId, {
+          hidden: false,
+          pinned: wasPinned,
+        });
+        store.actions.patch(convId, {
+          hidden: false,
+          pinned: wasPinned,
+          unread: false,
+        });
+        store.actions.openChat(convId);
+        await refreshFileConversations();
+        try {
+          await emit("chat-visibility-changed", {
+            id: convId,
+            hidden: false,
+          });
+        } catch {
+          // The local restore is complete; sibling windows can repair on
+          // their next disk hydration.
+        }
+        if (!wasCurrent) return;
+        store.actions.setCurrent(convId);
+        try {
+          await emit("chat-load-conversation", { conversationId: convId });
+        } catch {
+          // The restored row remains visible and selectable in this window.
+        }
+      },
+    });
+
+    if (!wasCurrent) return;
+
+    if (fallbackId) {
+      store.actions.setCurrent(fallbackId);
+      try {
+        await emit("chat-load-conversation", { conversationId: fallbackId });
+      } catch {
+        // Local currentId already moved; the panel can recover on next click.
+      }
+      return;
+    }
+
+    if (!hasRegisteredChatTabCloser()) {
       await startNewConversation();
     }
   };

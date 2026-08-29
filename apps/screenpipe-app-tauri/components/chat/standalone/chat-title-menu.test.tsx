@@ -31,12 +31,37 @@ beforeAll(() => {
 beforeEach(() => {
   useChatStore.setState({
     sessions: { [SESSION.id]: SESSION },
+    ephemeralSideConversationIds: {},
     currentId: SESSION.id,
     panelSessionId: SESSION.id,
   });
 });
 
 describe("ChatTitleMenu", () => {
+  it("does not expose durable history actions for a temporary side chat", () => {
+    useChatStore.getState().actions.upsert({
+      ...SESSION,
+      id: "temporary-side",
+      title: "temporary side chat",
+      ephemeral: true,
+      sideConversation: true,
+      sideConversationParentId: SESSION.id,
+    });
+
+    render(
+      <ChatTitleMenu
+        conversationId="temporary-side"
+        messages={[
+          { id: "u", role: "user", content: "question", timestamp: 1 },
+        ]}
+        renameConversation={vi.fn()}
+        archiveConversation={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
   it("keeps one visible title beside a menu scoped to that chat", async () => {
     const archiveConversation = vi.fn(async () => {});
     render(
@@ -64,6 +89,25 @@ describe("ChatTitleMenu", () => {
     await waitFor(() =>
       expect(archiveConversation).toHaveBeenCalledWith(SESSION.id),
     );
+  });
+
+  it("prints the archive shortcut on the title menu", async () => {
+    render(
+      <ChatTitleMenu
+        conversationId={SESSION.id}
+        messages={[
+          { id: "u", role: "user", content: "day recap", timestamp: 1 },
+        ]}
+        renameConversation={vi.fn()}
+        archiveConversation={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chat options for day recap" }),
+    );
+    expect(await screen.findByRole("button", { name: "Archive" })).toBeVisible();
+    expect(screen.getByText(/⌘E|Ctrl\+E/)).toBeVisible();
   });
 
   it("renames the same conversation from the title-owned menu", async () => {
