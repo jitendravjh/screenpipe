@@ -11,6 +11,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
 import { CollapsedSteerWorkRow } from "@/components/chat/standalone/collapsed-steer-work-row";
 import { ChatResponseFeedback } from "@/components/chat/standalone/chat-response-feedback";
+import { SelectedTextActions } from "@/components/chat/standalone/selected-text-actions";
 import {
   chatResponseValueActionProperties,
   chatTelemetryContextForResponse,
@@ -19,6 +20,7 @@ import { qualifiedValue } from "@/lib/analytics/qualified-value";
 import { MessageContent } from "@/components/chat/standalone/message-content";
 import { TurnStatus } from "@/components/chat/standalone/turn-status";
 import type { TurnSignals } from "@/lib/chat/turn-phase";
+import type { TurnLivenessStatus } from "@/lib/chat/turn-liveness";
 import {
   buildCollapsedSteerRenderItems,
   hasAssistantTextBody,
@@ -36,6 +38,7 @@ import type { ContentBlock, Message } from "@/lib/chat/types";
 import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
 import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
 import type { MarkdownCitationPlan } from "@/lib/chat/markdown-export";
+import type { ChatRichResult } from "@/lib/chat/rich-results";
 
 const MAX_MESSAGE_EDIT_HEIGHT_PX = 240;
 
@@ -73,6 +76,7 @@ export interface ChatMessageListProps {
   messages: Message[];
   isLoading: boolean;
   isStreaming: boolean;
+  turnLiveness?: TurnLivenessStatus | null;
   activeSourceFooterMessageId: string | null;
   expandedSteerWorkIds: Set<string>;
   onToggleCollapsedSteerWork: (id: string) => void;
@@ -98,6 +102,7 @@ export interface ChatMessageListProps {
   onOpenScheduleDialog: (messageId: string) => void;
   sendMessage: (message: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>;
   openFilePreview: (path: string) => void;
+  onOpenRichResult?: (result: ChatRichResult) => void | Promise<void>;
   branchConversation: (messageId: string) => Promise<void> | void;
   connectionItems?: ConnectionListItem[];
   onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
@@ -106,6 +111,8 @@ export interface ChatMessageListProps {
   onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
   onAnswerAgentAction?: (block: Extract<ContentBlock, { type: "agent_action" }>, selectedOptionId?: string) => Promise<boolean> | boolean;
   onAskUserReply?: (reply: string, displayLabel: string) => Promise<void> | void;
+  onAddSelectedTextToChat?: (text: string) => void;
+  onAskSelectedTextInSideChat?: (text: string) => void | Promise<void>;
   suppressSourceFooters?: boolean;
 }
 
@@ -113,6 +120,7 @@ export function ChatMessageList({
   messages,
   isLoading,
   isStreaming,
+  turnLiveness,
   activeSourceFooterMessageId,
   expandedSteerWorkIds,
   onToggleCollapsedSteerWork,
@@ -138,6 +146,7 @@ export function ChatMessageList({
   onOpenScheduleDialog,
   sendMessage,
   openFilePreview,
+  onOpenRichResult,
   branchConversation,
   connectionItems = [],
   onOpenConnectionSetup,
@@ -146,6 +155,8 @@ export function ChatMessageList({
   onDismissConnectionAction,
   onAnswerAgentAction,
   onAskUserReply,
+  onAddSelectedTextToChat,
+  onAskSelectedTextInSideChat,
   suppressSourceFooters = false,
 }: ChatMessageListProps) {
   // Null unless an ACP agent is installing/starting. Ticks only while it is.
@@ -164,6 +175,10 @@ export function ChatMessageList({
   );
 
   const turnActive = isLoading || isStreaming;
+  const transformationActive =
+    turnActive &&
+    turnLiveness?.state !== "offline" &&
+    turnLiveness?.state !== "stalled";
   const visibleMessages = messages.filter((message) => {
     if (message.role !== "assistant") return true;
     return hasRenderableAssistantBody(message) || isSteeredAssistantMessage(message);
@@ -206,7 +221,7 @@ export function ChatMessageList({
       }
     }
   }
-  const hasLiveToolStatusOwner = turnActive && visibleMessages.some(
+  const hasLiveToolStatusOwner = transformationActive && visibleMessages.some(
     (message) =>
       message.role === "assistant" &&
       hasAssistantToolWorkBody(message) &&
@@ -215,6 +230,12 @@ export function ChatMessageList({
 
   return (
     <>
+      {onAddSelectedTextToChat ? (
+        <SelectedTextActions
+          onAddToChat={onAddSelectedTextToChat}
+          onAskInSideChat={onAskSelectedTextInSideChat}
+        />
+      ) : null}
       <AnimatePresence mode="popLayout">
         {(() => {
           const renderItems = buildCollapsedSteerRenderItems(visibleMessages, {
@@ -246,13 +267,15 @@ export function ChatMessageList({
             const canShowMessageActions = !item.showActionsWhenExpandedBy ||
               expandedSteerWorkIds.has(item.showActionsWhenExpandedBy);
             const hasActiveSteerChild = steerChildActiveParentIds.has(message.id);
-            const isActiveStreamingAssistantMessage =
+            const isActiveAssistantMessage =
               message.role === "assistant" &&
               (isLoading || isStreaming) &&
               (message.id === activeAssistantMessageId || hasActiveSteerChild);
+            const isActiveStreamingAssistantMessage =
+              isActiveAssistantMessage && transformationActive;
             const shouldShowAssistantActions = message.role !== "assistant" || hasAssistantTextBody(message);
             const shouldShowMessageActionBar =
-              canShowMessageActions && !isActiveStreamingAssistantMessage && shouldShowAssistantActions;
+              canShowMessageActions && !isActiveAssistantMessage && shouldShowAssistantActions;
             const nextAssistant = visibleMessages
               .slice(messageIndex + 1)
               .find((candidate) => candidate.role === "assistant");
@@ -344,7 +367,7 @@ export function ChatMessageList({
                         beginEditingMessage(message, pendingCaretRef.current ?? undefined);
                       }}
                       className={cn(
-                        "relative rounded-xl text-sm overflow-hidden max-w-full transition-all",
+                        "relative rounded-lg text-sm overflow-hidden max-w-full transition-all",
                         message.role === "user"
                           ? "bg-muted/60 text-foreground px-4 py-3"
                           : "bg-background text-foreground py-1 w-full",
@@ -360,6 +383,9 @@ export function ChatMessageList({
                       }
                       data-testid="chat-message-bubble"
                       data-editing={editingMessageId === message.id ? "true" : "false"}
+                      data-selected-text-actions-target={
+                        message.role === "assistant" ? "true" : undefined
+                      }
                     >
                       {editingMessageId === message.id ? (
                         <div
@@ -444,6 +470,7 @@ export function ChatMessageList({
                           onImageClick={onOpenImageViewer}
                           onRetry={(prompt) => sendMessage(prompt)}
                           onOpenViewerPath={openFilePreview}
+                          onOpenRichResult={onOpenRichResult}
                           connectionItems={connectionItems}
                           onOpenConnectionSetup={onOpenConnectionSetup}
                           onConnectConnectionAction={onConnectConnectionAction}
@@ -637,6 +664,7 @@ export function ChatMessageList({
             booting,
             bootLabel: boot,
             streaming,
+            liveness: turnLiveness,
           };
 
           return (

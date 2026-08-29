@@ -171,12 +171,16 @@ export function latestSummaryInputAt(
 }
 
 export interface MeetingSummaryFailurePresentation {
-  kind: PipeErrorType | "auth_failed";
+  kind: PipeErrorType | "auth_failed" | "nothing_to_summarize" | "summary_not_saved";
+  /** Short, explicit heading for the persistent recovery surface. */
+  title: string;
   copy: string;
   /** Validated plan-upgrade action when the gateway offered one. */
   upgrade: QuotaUpgradeAction | null;
   /** Whether "retry summary" is a sensible primary action for this failure. */
   retryable: boolean;
+  /** Whether choosing another summary model is a useful recovery path. */
+  changeModelRecommended: boolean;
 }
 
 /** Rust pipe classifier values (`pipes/mod.rs parse_error_type`) → UI types. */
@@ -200,12 +204,36 @@ export function meetingSummaryFailure(
     /authentication failed|invalid api key|unauthorized/.test(
       errorMessage.toLowerCase(),
     );
+  // Engine finalizer verdicts (`meeting_summary_finalizer.rs`): terminal,
+  // factual states — not provider errors, so they get calm, specific copy.
+  if (normalizedErrorType === "nothing_to_summarize") {
+    return {
+      kind: "nothing_to_summarize",
+      title: "Nothing to summarize",
+      copy: "No speech was captured for this meeting, so there's no summary. Anything recorded stays saved on this note.",
+      upgrade: null,
+      retryable: false,
+      changeModelRecommended: false,
+    };
+  }
+  if (normalizedErrorType === "summary_not_saved") {
+    return {
+      kind: "summary_not_saved",
+      title: "Summary didn't save",
+      copy: "The summary run finished but nothing landed on this meeting. Your transcript is safe — retry to summarize again.",
+      upgrade: null,
+      retryable: true,
+      changeModelRecommended: false,
+    };
+  }
   if (authFailed) {
     return {
       kind: "auth_failed",
-      copy: "The summary couldn't authenticate with your AI provider. Check its API key or switch models, then retry. Your meeting and transcript are safe.",
+      title: "AI provider needs attention",
+      copy: "The configured summary model couldn't authenticate with its AI provider. Choose another model or check its API key. Your meeting and transcript are safe.",
       upgrade: null,
       retryable: false,
+      changeModelRecommended: true,
     };
   }
   const kind =
@@ -217,32 +245,40 @@ export function meetingSummaryFailure(
     case "rate_limit":
       return {
         kind,
+        title: "AI is temporarily rate-limited",
         copy: "AI is temporarily rate-limited. Retry in a moment — your meeting and transcript are safe.",
         upgrade: null,
         retryable: true,
+        changeModelRecommended: true,
       };
     case "daily_limit":
     case "credits_exhausted":
     case "quota_exhausted":
       return {
         kind,
-        copy: "Your AI usage limit is reached. Your meeting and transcript are safe — retry after it resets, upgrade, or switch to a local model or your own provider key.",
+        title: "AI usage limit reached",
+        copy: "The configured summary model hit your AI usage limit. Upgrade for a higher limit, or choose a local model or one with your own provider key. Your meeting and transcript are safe.",
         upgrade,
         retryable: false,
+        changeModelRecommended: true,
       };
     case "model_not_allowed":
       return {
         kind,
-        copy: "Your plan can't use the configured AI model. Switch the preset to an included model, or upgrade. Your meeting and transcript are safe.",
+        title: "Summary model not included",
+        copy: "Your plan doesn't include the configured summary model. Choose an included model or upgrade. Your meeting and transcript are safe.",
         upgrade,
         retryable: false,
+        changeModelRecommended: true,
       };
     default:
       return {
         kind,
+        title: "Summary could not be generated",
         copy: "Your meeting and transcript are safe. Retry when you're ready.",
         upgrade: null,
         retryable: true,
+        changeModelRecommended: false,
       };
   }
 }

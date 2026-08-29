@@ -269,6 +269,30 @@ async closeWindow(window: ShowRewindWindow) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async codingWorkspaceCreate(conversationId: string, repositoryPath: string) : Promise<Result<CodingWorkspace, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("coding_workspace_create", { conversationId, repositoryPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async codingWorkspaceGet(conversationId: string) : Promise<Result<CodingWorkspace | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("coding_workspace_get", { conversationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async codingWorkspacePrepare(conversationId: string, prompt: string, startingPath: string | null) : Promise<Result<CodingWorkspacePreparation, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("coding_workspace_prepare", { conversationId, prompt, startingPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async completeOnboarding() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("complete_onboarding") };
@@ -707,6 +731,15 @@ async getMonitors() : Promise<Result<MonitorDevice[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Return the website UTM attribution already resolved at app startup.
+ *
+ * This is read-only and never triggers another network request. Analytics can
+ * be disabled before the manager is installed, so absence is a normal result.
+ */
+async getOnboardingAttribution() : Promise<Attribution | null> {
+    return await TAURI_INVOKE("get_onboarding_attribution");
+},
 async getOnboardingStatus() : Promise<Result<OnboardingStore, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_onboarding_status") };
@@ -919,6 +952,14 @@ async isCapturePaused() : Promise<boolean> {
 },
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
+},
+/**
+ * Whether the running local API currently enforces the rolling history window.
+ * This is the authoritative app-wide value shared by every webview and backend
+ * route, so detached windows do not depend on duplicating account hydration.
+ */
+async isHistoryAccessRestricted() : Promise<boolean> {
+    return await TAURI_INVOKE("is_history_access_restricted");
 },
 /**
  * Check if click-through is currently enabled (Windows only)
@@ -1368,6 +1409,18 @@ async ownedBrowserHide() : Promise<Result<null, string>> {
 }
 },
 /**
+ * Move through the selected webview's own navigation history. A missing tab
+ * id addresses the agent-controlled default browser.
+ */
+async ownedBrowserHistory(tabId: string | null, direction: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_history", { tabId, direction }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Navigate the embedded webview to `url`.
  *
  * Frontend restore/reload calls pass the foreground conversation id as
@@ -1401,6 +1454,55 @@ async ownedBrowserResolveSessionAccess(requestId: string, allow: boolean) : Prom
 async ownedBrowserSetBounds(parent: string, x: number, y: number, width: number, height: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("owned_browser_set_bounds", { parent, x, y, width, height }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ownedBrowserTabClearBrowsingData(tabId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_clear_browsing_data", { tabId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ownedBrowserTabClose(tabId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_close", { tabId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async ownedBrowserTabHide(tabId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_hide", { tabId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Navigate one user-created browser tab without touching the agent-controlled
+ * default tab. If its native child is not mounted yet, the URL is consumed by
+ * the first bounds update.
+ */
+async ownedBrowserTabNavigate(tabId: string, url: string, owner: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_navigate", { tabId, url, owner }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Position one user-created browser tab. Every tab owns a distinct native
+ * child webview and retains its page state while another tab is visible.
+ */
+async ownedBrowserTabSetBounds(tabId: string, parent: string, x: number, y: number, width: number, height: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_tab_set_bounds", { tabId, parent, x, y, width, height }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1894,6 +1996,10 @@ async redactPiiForFeedback(text: string, settingsJson: string) : Promise<Result<
 },
 /**
  * Tauri command: re-encrypt store.bin after frontend saves.
+ *
+ * Runs on a blocking worker. The previous sync command ran `fsync` of a
+ * ~262KB store on the AppKit main thread and stalled every other IPC
+ * (sampled 2026-08-26: 186% screenpipe-app + 93% Web Content).
  */
 async reencryptStore() : Promise<Result<null, string>> {
     try {
@@ -2972,6 +3078,7 @@ export type ActivityHistoryCoverage = { start: string; end: string }
 export type ActivityHistoryEntry = { id: string; kind: string; meeting_id: number | null; start_at: string; end_at: string; title: string; summary: string; evidence: ActivityHistoryEvidence[] }
 export type ActivityHistoryEvidence = { kind: string; at: string; frame_id: number | null; meeting_id: number | null; app_name: string | null; label: string }
 export type AecMode = "off" | "screenpipe" | "macos" | "windows"
+export type Attribution = { utmSource: string | null; utmMedium: string | null; utmCampaign: string | null; utmContent: string | null; utmTerm: string | null }
 export type AudioDeviceInfo = { name: string; isDefault: boolean;
 /**
  * True for a Bluetooth *input* device that is also a combo headset (the
@@ -3080,6 +3187,8 @@ export type ChatGptOAuthStatus = { logged_in: boolean;
  * keychain failure, timeout, etc.).
  */
 error: string | null }
+export type CodingWorkspace = { version: number; conversationId: string; repoRoot: string; gitCommonDir: string; worktreePath: string; branch: string; baseCommit: string; sourceDirty: boolean; createdAt: string }
+export type CodingWorkspacePreparation = { status: string; workspace: CodingWorkspace | null; candidates: string[]; reason: string | null; routeSessionId: string | null }
 export type Credits = { amount: number }
 /**
  * A skill folder discovered somewhere on the user's device.
@@ -3114,6 +3223,14 @@ export type DiscoveredHost = { host: string; port: number; user: string | null; 
  * Only set when `HostName` resolves to an IP different from the alias.
  */
 alias?: string | null }
+/**
+ * One strict hostname rule used by browser capture allowlists and blocklists.
+ *
+ * `domain` is normalized by the capture policy before matching. The rule
+ * always matches the domain itself; `include_subdomains` extends the match to
+ * descendant hosts, except descendants rooted at `excluded_subdomains`.
+ */
+export type DomainRule = { domain: string; includeSubdomains?: boolean; excludedSubdomains?: string[] }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
 export type EngineEvent = { name: string; data: JsonValue }
 export type EnterpriseHostIdentity = { machine_id_hash: string | null; os_user_id_hash: string | null }
@@ -3199,7 +3316,7 @@ export type OnboardingStore = { isCompleted: boolean; completedAt: string | null
  * Current step in onboarding flow (login, intro, usecases, status)
  * Used to resume after app restart (e.g., after granting permissions)
  */
-currentStep?: string | null }
+currentStep?: string | null; firstRunSummaryPhase?: string; firstRunSummaryStartedAt?: string | null; firstRunSummaryChatId?: string | null; firstRunSummaryNotificationSentAt?: string | null; firstRunSummaryNotificationId?: string | null; firstRunSummaryError?: string | null; firstRunSummaryTelemetryVersion?: number }
 /**
  * Snapshot of a pending update, exposed to the frontend via
  * `get_pending_update`. The banner queries this on mount so it can hydrate
@@ -3292,7 +3409,14 @@ allowedTools?: string[] | null;
  * session, set only when reopening a conversation whose agent process
  * is gone. Ignored by the native Pi backend.
  */
-resumeSessionId?: string | null }
+resumeSessionId?: string | null;
+/**
+ * Headless surfaces (activity generation) have no approval card to show,
+ * so their ACP sessions run unattended: the runtime takes the adapter's
+ * allow option instead of stranding the run on a prompt nobody can see,
+ * and chat control is disabled. Ignored by the native Pi backend.
+ */
+unattended?: boolean }
 /**
  * A user prompt that's been enqueued but not yet written to Pi's stdin.
  * Surfaced to the UI so the chat can render "queued" cards while a prior
@@ -3727,9 +3851,15 @@ ignoredWindows: string[];
  */
 includedWindows: string[];
 /**
- * URLs to exclude from capture.
+ * Browser URLs to exclude from capture. Existing string entries remain
+ * supported; new entries can use explicit structured domain rules.
  */
-ignoredUrls?: string[];
+ignoredUrls?: UrlRule[];
+/**
+ * Strict browser hostname allowlist. When non-empty, native apps and
+ * browser windows without a positively detected matching URL are skipped.
+ */
+includedUrls?: DomainRule[];
 /**
  * Automatically detect and skip incognito / private browsing windows.
  */
@@ -4128,6 +4258,14 @@ export type SyncDeviceInfo = { id: string; deviceId: string; deviceName: string 
  * Sync status response.
  */
 export type SyncStatusResponse = { enabled: boolean; isSyncing: boolean; lastSync: string | null; lastError: string | null; storageUsed: number | null; storageLimit: number | null; deviceCount: number | null; deviceLimit: number | null; syncTier: string | null; machineId: string }
+/**
+ * A browser URL block rule.
+ *
+ * Strings are the legacy `ignoredUrls` format and keep their historical
+ * domain matching behavior. Structured rules provide explicit exact-domain,
+ * subdomain, and exception semantics without introducing a second setting.
+ */
+export type UrlRule = string | DomainRule
 export type User = { id: string | null; name: string | null; email: string | null; image: string | null; token: string | null; clerk_id: string | null; api_key: string | null; credits: Credits | null; stripe_connected: boolean | null; stripe_account_status: string | null; github_username: string | null; bio: string | null; website: string | null; contact: string | null; cloud_subscribed: boolean | null; credits_balance: number | null; app_entitled: boolean | null; subscription_plan: string | null; entitlement: JsonValue | null; enterprise_account: JsonValue | null }
 export type ViewerContent = { kind: "text"; text: string; name: string; path: string; truncated: boolean; total_bytes: number } | { kind: "image"; data_url: string; name: string; path: string } |
 /**

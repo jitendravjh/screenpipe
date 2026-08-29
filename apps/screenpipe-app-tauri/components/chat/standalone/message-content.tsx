@@ -8,7 +8,10 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { Check, Calendar, ChevronDown, ChevronRight, ChevronUp, KeyRound, Loader2, Plug, RefreshCw, ShieldCheck } from "lucide-react";
 import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
-import { MarkdownBlock } from "@/components/chat/markdown-block";
+import {
+  MarkdownBlock,
+  type MarkdownBlockOptions,
+} from "@/components/chat/markdown-block";
 import { AskUserToolCard, isAskUserToolCall } from "@/components/chat/standalone/ask-user-tool-card";
 import {
   AttachedContextCard,
@@ -47,6 +50,17 @@ import {
 import { renderChartFence } from "@/components/chat/charts/chat-chart";
 import { PlanBlock } from "@/components/chat/standalone/plan-block";
 import { ActivityIcon, type ActivityIconState } from "@/components/chat/standalone/activity-icon";
+import {
+  parseStructuredAssistantOutput,
+  StructuredOutputBlock,
+} from "@/components/chat/standalone/structured-output";
+import { RichResultCards } from "@/components/chat/standalone/rich-result-card";
+import {
+  chatRichResultsFromToolCalls,
+  dedupeChatRichResults,
+  parseChatRichResults,
+  type ChatRichResult,
+} from "@/lib/chat/rich-results";
 
 const MermaidDiagram = React.lazy(() =>
   import("@/components/rewind/mermaid-diagram").then((mod) => ({
@@ -367,10 +381,108 @@ function RunningToolStatus({ toolCall }: { toolCall: ToolCall }) {
   );
 }
 
+const MIN_COMPACTED_TOOL_CALLS = 3;
+
+type ToolActivityRailEntry = {
+  toolCall: ToolCall;
+  groupedToolCalls?: ToolCall[];
+  childToolCalls: ToolCall[];
+};
+
+function toolActivityCompactionKey(
+  toolCall: ToolCall,
+  errorRecovered: boolean,
+  waitingForUser: boolean,
+): string | null {
+  if (toolCall.subagent || isAskUserToolCall(toolCall)) return null;
+
+  const presentation = presentToolActivity(toolCall);
+  const showError = Boolean(toolCall.isError && !errorRecovered);
+  const state = toolCall.isRunning && waitingForUser
+    ? "waiting"
+    : toolCall.isRunning
+      ? "running"
+      : showError
+        ? "error"
+        : "completed";
+  const label = toolCall.isRunning || showError
+    ? presentation.runningLabel
+    : presentation.completedLabel;
+  const target = extractConnectionIconFromToolCall(toolCall)
+    ?? extractWebTargetFromToolCall(toolCall)?.domain
+    ?? extractAppFromToolCall(toolCall)
+    ?? "";
+
+  return JSON.stringify([
+    toolCall.agentId ?? "",
+    toolCall.toolName.toLowerCase(),
+    presentation.icon,
+    state,
+    label,
+    target,
+  ]);
+}
+
+function compactToolActivityRows(
+  toolCalls: ToolCall[],
+  childrenByParent: Map<string, ToolCall[]>,
+  errorRecovered: boolean,
+  waitingForUser: boolean,
+): ToolActivityRailEntry[] {
+  const entries: ToolActivityRailEntry[] = [];
+  let run: ToolCall[] = [];
+  let runKey: string | null = null;
+
+  const flushRun = () => {
+    if (run.length >= MIN_COMPACTED_TOOL_CALLS) {
+      entries.push({
+        toolCall: run[0],
+        groupedToolCalls: [...run],
+        childToolCalls: [],
+      });
+    } else {
+      for (const toolCall of run) {
+        entries.push({
+          toolCall,
+          childToolCalls: childrenByParent.get(toolCall.id) ?? [],
+        });
+      }
+    }
+    run = [];
+    runKey = null;
+  };
+
+  for (const toolCall of toolCalls) {
+    const childToolCalls = childrenByParent.get(toolCall.id) ?? [];
+    const key = childToolCalls.length === 0
+      ? toolActivityCompactionKey(toolCall, errorRecovered, waitingForUser)
+      : null;
+    if (key && key === runKey) {
+      run.push(toolCall);
+      continue;
+    }
+    flushRun();
+    if (key) {
+      run = [toolCall];
+      runKey = key;
+    } else {
+      entries.push({ toolCall, childToolCalls });
+    }
+  }
+  flushRun();
+  return entries;
+}
+
+function compactedToolCountLabel(toolCall: ToolCall, count: number): string {
+  const noun = toolCall.toolName.toLowerCase().includes("query") ? "queries" : "steps";
+  return `${count} ${noun}`;
+}
+
 function ToolCallRailItem({
   toolCall,
   isLast,
   childToolCalls,
+  groupedToolCalls,
   errorRecovered = false,
   waitingForUser = false,
   onAskUserReply,
@@ -381,25 +493,40 @@ function ToolCallRailItem({
   // expand so clicking the container toggles its whole subtree, rather than
   // leaving the children as always-on siblings that clutter the rail.
   childToolCalls?: ToolCall[];
+  // Adjacent equivalent calls are one high-level row. The individual calls
+  // remain available behind a second disclosure click.
+  groupedToolCalls?: ToolCall[];
   errorRecovered?: boolean;
   waitingForUser?: boolean;
   onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const reduceMotion = useReducedMotion();
-  const hasChildren = (childToolCalls?.length ?? 0) > 0;
-  const presentation = presentToolActivity(toolCall);
-  const showError = Boolean(toolCall.isError && !errorRecovered);
-  const label = toolCall.isRunning || showError
+  const compactedCalls = groupedToolCalls && groupedToolCalls.length > 1
+    ? groupedToolCalls
+    : null;
+  const statusToolCall = compactedCalls?.find((call) => call.isRunning)
+    ?? compactedCalls?.find((call) => call.isError && !errorRecovered)
+    ?? compactedCalls?.[compactedCalls.length - 1]
+    ?? toolCall;
+  const hasChildren = Boolean(compactedCalls) || (childToolCalls?.length ?? 0) > 0;
+  const presentation = presentToolActivity(statusToolCall);
+  const showError = compactedCalls
+    ? compactedCalls.some((call) => call.isError && !errorRecovered)
+    : Boolean(toolCall.isError && !errorRecovered);
+  const isRunning = compactedCalls
+    ? compactedCalls.some((call) => call.isRunning)
+    : toolCall.isRunning;
+  const label = isRunning || showError
     ? presentation.runningLabel
     : presentation.completedLabel;
-  const appName = extractAppFromToolCall(toolCall);
-  const connectionIconName = extractConnectionIconFromToolCall(toolCall);
-  const webTarget = extractWebTargetFromToolCall(toolCall);
-  const isAskUser = isAskUserToolCall(toolCall);
-  const state: ActivityIconState = toolCall.isRunning && (waitingForUser || isAskUser)
+  const appName = extractAppFromToolCall(statusToolCall);
+  const connectionIconName = extractConnectionIconFromToolCall(statusToolCall);
+  const webTarget = extractWebTargetFromToolCall(statusToolCall);
+  const isAskUser = isAskUserToolCall(statusToolCall);
+  const state: ActivityIconState = isRunning && (waitingForUser || isAskUser)
     ? "waiting"
-    : toolCall.isRunning
+    : isRunning
       ? "running"
       : showError
         ? "error"
@@ -413,7 +540,11 @@ function ToolCallRailItem({
   ) : undefined;
 
   return (
-    <div className="relative flex min-w-0" data-activity-state={state}>
+    <div
+      className="relative flex min-w-0"
+      data-activity-state={state}
+      data-tool-call-count={compactedCalls?.length ?? 1}
+    >
       {/* Vertical rail line */}
       <div className="flex w-6 flex-shrink-0 flex-col items-center">
         <div className="relative flex h-5 w-6 items-center justify-center">
@@ -443,14 +574,20 @@ function ToolCallRailItem({
             </span>
             {showError && (
               <span className="shrink-0 border border-destructive/40 px-1 font-mono text-[9px] uppercase tracking-wide text-destructive">
-                failed
+                {compactedCalls
+                  ? `${compactedCalls.filter((call) => call.isError).length} failed`
+                  : "failed"}
               </span>
             )}
-            {hasChildren && !expanded && (
+            {compactedCalls && !expanded ? (
+              <span className="flex-shrink-0 text-[11px] text-foreground/30">
+                {compactedToolCountLabel(statusToolCall, compactedCalls.length)}
+              </span>
+            ) : hasChildren && !expanded ? (
               <span className="flex-shrink-0 text-[11px] text-foreground/30">
                 {childToolCalls!.length} {childToolCalls!.length === 1 ? "step" : "steps"}
               </span>
-            )}
+            ) : null}
             {expanded ? (
               <ChevronDown className="h-3 w-3 flex-shrink-0 text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150" />
             ) : (
@@ -458,22 +595,25 @@ function ToolCallRailItem({
             )}
           </button>
         )}
-        {!isAskUser && <RunningToolStatus toolCall={toolCall} />}
+        {!isAskUser && !compactedCalls && <RunningToolStatus toolCall={toolCall} />}
         <AnimatePresence>
           {!isAskUser && expanded && (
             <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: "auto", opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
+              // Nested disclosures can be opened after the parent rail has
+              // already animated. Starting another entrance animation here can
+              // leave WebKit at opacity 0, so keep the live details in normal
+              // document flow and only animate their exit.
+              initial={false}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
               transition={{ duration: reduceMotion ? 0 : 0.15 }}
-              className="overflow-hidden"
             >
               <div className="border-l border-border ml-0 pl-3 mt-1 mb-1">
-                <FriendlyToolDetails toolCall={toolCall} />
+                {!compactedCalls && <FriendlyToolDetails toolCall={toolCall} />}
                 {/* Streamed output: live while running, and kept after the tool
                     finishes so what streamed doesn't vanish. Only for bash once
                     done, since other tools already show their full result below. */}
-                {toolCall.progress && (toolCall.isRunning || toolCall.toolName === "bash" || toolCall.subagent) && (
+                {!compactedCalls && toolCall.progress && (toolCall.isRunning || toolCall.toolName === "bash" || toolCall.subagent) && (
                   <div className="mt-1 pt-1 border-t border-border/50">
                     <pre className="whitespace-pre-wrap break-words max-h-[200px] overflow-y-auto overflow-x-hidden max-w-full text-xs font-mono text-foreground/50">
                       {toolCall.progress}
@@ -485,7 +625,7 @@ function ToolCallRailItem({
                     ... agentId ... output_file ..."), meant for the model, not the
                     user. Its real content is the nested transcript above, so
                     suppress the launch boilerplate. */}
-                {toolCall.result !== undefined && toolCall.toolName !== "bash" && !toolCall.subagent && (
+                {!compactedCalls && toolCall.result !== undefined && toolCall.toolName !== "bash" && !toolCall.subagent && (
                   <div className="mt-1 pt-1 border-t border-border/50">
                     <pre className={cn(
                       "whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto overflow-x-hidden max-w-full text-xs font-mono",
@@ -498,7 +638,20 @@ function ToolCallRailItem({
                 {/* A subagent's own tools nest inside its expand, so clicking
                     the subagent row reveals or hides its whole subtree instead
                     of leaving the children always on. */}
-                {hasChildren && (
+                {compactedCalls ? (
+                  <div className="mt-1" data-testid="tool-activity-group-details">
+                    {compactedCalls.map((call, index) => (
+                      <ToolCallRailItem
+                        key={toolCallRenderKey(call, index)}
+                        toolCall={call}
+                        isLast={index === compactedCalls.length - 1}
+                        errorRecovered={errorRecovered}
+                        waitingForUser={waitingForUser}
+                        onAskUserReply={onAskUserReply}
+                      />
+                    ))}
+                  </div>
+                ) : hasChildren ? (
                   <div className="mt-1">
                     {childToolCalls!.map((child, j) => (
                       <ToolCallRailItem
@@ -511,7 +664,7 @@ function ToolCallRailItem({
                       />
                     ))}
                   </div>
-                )}
+                ) : null}
               </div>
             </motion.div>
           )}
@@ -842,11 +995,15 @@ function collapseHiddenWorkGroups(grouped: GroupedBlock[]): GroupedBlock[] {
 
 /**
  * Merge all tool/work groups into a single "Worked for Xs" rail at the top.
- * Intermediate narration text between tool calls is dropped — only the
- * final text block (the actual response after all tools finish) renders
- * as visible prose. Connection-action blocks always render outside.
+ * Intermediate narration text between tool calls is dropped. Prefer prose
+ * after the final tool; when a completed turn ends on a tool, keep its last
+ * non-empty text block so the assistant answer does not disappear.
+ * Connection-action blocks always render outside.
  */
-function mergeWorkAndIntermediateText(groups: GroupedBlock[]): GroupedBlock[] {
+function mergeWorkAndIntermediateText(
+  groups: GroupedBlock[],
+  promoteLastTextFallback: boolean,
+): GroupedBlock[] {
   // Find the last work/tool group — everything up to that boundary is
   // "work". Text after is the final response.
   let lastWorkIdx = -1;
@@ -866,6 +1023,7 @@ function mergeWorkAndIntermediateText(groups: GroupedBlock[]): GroupedBlock[] {
   let totalDurationMs = 0;
   let firstKey: number | null = null;
   const finalBlocks: GroupedBlock[] = [];
+  let lastTextFallback: Extract<GroupedBlock, { type: "text" }> | null = null;
 
   for (let i = 0; i <= lastWorkIdx; i++) {
     const g = groups[i];
@@ -876,6 +1034,8 @@ function mergeWorkAndIntermediateText(groups: GroupedBlock[]): GroupedBlock[] {
     } else if (g.type === "tool-group") {
       firstKey ??= g.key;
       allToolCalls.push(...g.toolCalls);
+    } else if (g.type === "text") {
+      lastTextFallback = g;
     } else if (
       g.type === "connection-action" ||
       g.type === "agent-action" ||
@@ -887,7 +1047,7 @@ function mergeWorkAndIntermediateText(groups: GroupedBlock[]): GroupedBlock[] {
     ) {
       finalBlocks.push(g);
     }
-    // text and thinking blocks before the boundary are dropped
+    // thinking blocks and all but the last text fallback are dropped
   }
 
   // Build the merged work group
@@ -903,6 +1063,11 @@ function mergeWorkAndIntermediateText(groups: GroupedBlock[]): GroupedBlock[] {
   // Everything after lastWorkIdx is the final response
   for (let i = lastWorkIdx + 1; i < groups.length; i++) {
     finalBlocks.push(groups[i]);
+  }
+
+  const hasFinalText = finalBlocks.some((group) => group.type === "text");
+  if (promoteLastTextFallback && !hasFinalText && lastTextFallback) {
+    finalBlocks.push(lastTextFallback);
   }
 
   return finalBlocks;
@@ -1443,11 +1608,10 @@ function ToolActivityGroup({
       <AnimatePresence>
         {isExpanded && (
           <motion.div
-            initial={e2eForceExpanded ? false : { height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
+            initial={reduceMotion || e2eForceExpanded ? false : { opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
             transition={{ duration: reduceMotion || e2eForceExpanded ? 0 : 0.15 }}
-            className="overflow-hidden"
           >
             <div
               className={cn(
@@ -1483,12 +1647,17 @@ function ToolActivityGroup({
                     topLevel.push(tc);
                   }
                 }
-                return topLevel.map((tc, i) => {
-                  const children = childrenByParent.get(tc.id) ?? [];
-                  const isLastTop = i === topLevel.length - 1;
+                const railEntries = compactToolActivityRows(
+                  topLevel,
+                  childrenByParent,
+                  recoveredWithAnswer,
+                  waitingForUser,
+                );
+                return railEntries.map((entry, i) => {
+                  const isLastTop = i === railEntries.length - 1;
                   return (
                     <motion.div
-                      key={toolCallRenderKey(tc, i)}
+                      key={toolCallRenderKey(entry.toolCall, i)}
                       initial={reduceMotion || e2eForceExpanded ? false : { opacity: 0, x: -8 }}
                       animate={{ opacity: 1, x: 0 }}
                       transition={{
@@ -1497,9 +1666,10 @@ function ToolActivityGroup({
                       }}
                     >
                       <ToolCallRailItem
-                        toolCall={tc}
+                        toolCall={entry.toolCall}
                         isLast={isLastTop}
-                        childToolCalls={children}
+                        childToolCalls={entry.childToolCalls}
+                        groupedToolCalls={entry.groupedToolCalls}
                         errorRecovered={recoveredWithAnswer}
                         waitingForUser={waitingForUser}
                         onAskUserReply={onAskUserReply}
@@ -1540,6 +1710,7 @@ export function MessageContent({
   onImageClick,
   onRetry,
   onOpenViewerPath,
+  onOpenRichResult,
   onOpenConnectionSetup,
   onConnectConnectionAction,
   onContinueConnectionAction,
@@ -1547,6 +1718,7 @@ export function MessageContent({
   onAnswerAgentAction,
   onAskUserReply,
   onSendPrompt,
+  markdownOptions,
 }: {
   message: Message;
   isGenerating?: boolean;
@@ -1558,6 +1730,7 @@ export function MessageContent({
   onImageClick?: (images: string[], index: number) => void;
   onRetry?: (prompt: string) => void;
   onOpenViewerPath?: (path: string) => void;
+  onOpenRichResult?: (result: ChatRichResult) => void | Promise<void>;
   onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
   onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
   onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
@@ -1565,6 +1738,8 @@ export function MessageContent({
   onAnswerAgentAction?: (block: Extract<ContentBlock, { type: "agent_action" }>, selectedOptionId?: string) => Promise<boolean> | boolean;
   onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
   onSendPrompt?: (prompt: string, displayLabel: string) => void | Promise<void>;
+  /** Bounded renderer extensions for embedded Chat surfaces such as meetings. */
+  markdownOptions?: MarkdownBlockOptions;
 }) {
   const isUser = message.role === "user";
   const chartPromptSender = !isUser && !isGenerating ? onSendPrompt : undefined;
@@ -1627,7 +1802,7 @@ export function MessageContent({
           <div
             key={`doc-${doc.name}-${i}`}
             title={`${doc.name} — ${doc.charCount.toLocaleString()} chars${doc.truncated ? " (truncated)" : ""}`}
-            className="flex items-center gap-2.5 h-20 max-w-[260px] rounded-xl border border-border/50 bg-muted/40 px-3 shadow-sm"
+            className="flex items-center gap-2.5 h-20 max-w-[260px] rounded-lg border border-border/50 bg-muted/40 px-3 shadow-sm"
           >
             <div className={`shrink-0 w-11 h-11 rounded-lg flex items-center justify-center text-[10px] font-semibold tracking-tight ${badge.tint}`}>
               {badge.label}
@@ -1645,8 +1820,10 @@ export function MessageContent({
         <button
           key={`img-${i}`}
           type="button"
+          onMouseDown={(event) => event.stopPropagation()}
+          onMouseUp={(event) => event.stopPropagation()}
           onClick={() => onImageClick?.(message.images ?? [], i)}
-          className="rounded-xl border border-border/50 shadow-sm overflow-hidden p-0 block text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="rounded-lg border border-border/50 shadow-sm overflow-hidden p-0 block text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={img} alt={`Attached ${i + 1}`} className="h-20 w-20 min-h-20 min-w-20 object-cover cursor-pointer" />
@@ -1711,12 +1888,26 @@ export function MessageContent({
   if (message.contentBlocks && message.contentBlocks.length > 0) {
     const grouped = groupContentBlocks(message.contentBlocks);
     const collapsed = collapseHiddenWorkGroups(grouped);
-    const displayGroups = mergeWorkAndIntermediateText(collapsed);
+    const displayGroups = mergeWorkAndIntermediateText(collapsed, !isGenerating);
+    const parsedTextByKey = new Map<number, ReturnType<typeof parseChatRichResults>>();
+    const directiveResults: ChatRichResult[] = [];
+    for (const group of displayGroups) {
+      if (group.type !== "text") continue;
+      const parsed = isUser
+        ? { text: group.text, results: [] }
+        : parseChatRichResults(group.text, { streaming: isGenerating });
+      parsedTextByKey.set(group.key, parsed);
+      directiveResults.push(...parsed.results);
+    }
+    const toolResults = chatRichResultsFromToolCalls(
+      message.contentBlocks.flatMap((block) => block.type === "tool" ? [block.toolCall] : []),
+    );
+    const richResults = dedupeChatRichResults([...toolResults, ...directiveResults]);
 
     // If all blocks were absorbed (for example, thinking-only output with no
     // visible text or tool work), render nothing. The loader covers the active
     // case and an empty stopped turn should not invent a finished state.
-    if (displayGroups.length === 0 && !isGenerating && !sourceFooter && !retryCta) {
+    if (displayGroups.length === 0 && richResults.length === 0 && !isGenerating && !sourceFooter && !retryCta) {
       return null;
     }
 
@@ -1733,13 +1924,28 @@ export function MessageContent({
     const recoveredWithAnswer = !isGenerating && hasAssistantTextBody(message);
     return (
       <div className="space-y-2 min-w-0 w-full overflow-hidden">
-        {displayGroups.map((group) => {
+        {displayGroups.map((group, groupIndex) => {
           if (group.type === "text") {
+            const text = parsedTextByKey.get(group.key)?.text ?? group.text;
+            if (!text) return null;
+            const structuredOutput = !isUser
+              ? parseStructuredAssistantOutput(text)
+              : null;
+            if (structuredOutput) {
+              return (
+                <StructuredOutputBlock
+                  key={`text-${group.key}`}
+                  output={structuredOutput}
+                />
+              );
+            }
             return (
               <MarkdownBlock
+                {...markdownOptions}
                 key={`text-${group.key}`}
-                text={group.text}
+                text={text}
                 isUser={isUser}
+                streaming={isGenerating && groupIndex === displayGroups.length - 1}
                 onOpenViewerPath={onOpenViewerPath}
                 renderSpecialCodeBlock={(language, content) => {
                   if (language === "mermaid") {
@@ -1834,6 +2040,7 @@ export function MessageContent({
           }
           return null;
         })}
+        <RichResultCards results={richResults} onOpen={onOpenRichResult} />
         {sourceFooter}
         {retryCta}
       </div>
@@ -1850,20 +2057,31 @@ export function MessageContent({
   // "(tool result)" is a persistence placeholder given to tool-only messages so
   // they are not stored empty. It is not user-facing text, so never render it as
   // an assistant bubble (the tool activity itself renders from contentBlocks).
-  const displayText = rawText === "(tool result)" ? "" : rawText;
+  const unparsedDisplayText = rawText === "(tool result)" ? "" : rawText;
+  const parsedRichResults = isUser
+    ? { text: unparsedDisplayText, results: [] }
+    : parseChatRichResults(unparsedDisplayText, { streaming: isGenerating });
+  const displayText = parsedRichResults.text;
   const hasMeaningfulText = Boolean(displayText && displayText !== "Processing...");
+  const structuredOutput = !isUser && displayText
+    ? parseStructuredAssistantOutput(displayText)
+    : null;
 
-  if (!isUser && !hasMeaningfulText && !attachmentsRow && !sourceFooter && !retryCta) {
+  if (!isUser && !hasMeaningfulText && parsedRichResults.results.length === 0 && !attachmentsRow && !sourceFooter && !retryCta) {
     return null;
   }
 
   return (
     <div className="space-y-2 min-w-0 w-full">
       {attachmentsRow}
-      {displayText ? (
+      {structuredOutput ? (
+        <StructuredOutputBlock output={structuredOutput} />
+      ) : displayText ? (
         <MarkdownBlock
+          {...markdownOptions}
           text={displayText}
           isUser={isUser}
+          streaming={isGenerating}
           onOpenViewerPath={onOpenViewerPath}
           renderSpecialCodeBlock={(language, content) => {
             if (language === "mermaid") {
@@ -1876,6 +2094,7 @@ export function MessageContent({
           }}
         />
       ) : null}
+      <RichResultCards results={parsedRichResults.results} onOpen={onOpenRichResult} />
       {sourceFooter}
       {retryCta}
     </div>

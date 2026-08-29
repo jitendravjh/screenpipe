@@ -195,6 +195,9 @@ export interface ChatMessage {
  *                    rather than "Recents". */
 export type ConversationKind = "chat" | "pipe-watch" | "pipe-run";
 
+/** The client surface that hosted an imported agent conversation. */
+export type AgentHarness = "terminal" | "cursor" | "github-copilot" | "screenpipe";
+
 /** Pipe-specific context attached to `pipe-watch` / `pipe-run`
  *  conversations. Drives the in-panel banner and the sidebar
  *  grouping. */
@@ -215,6 +218,8 @@ export interface ChatConversation {
 		source: "claude-code" | "codex";
 		sourceId: string;
 		importedAt: number;
+		/** Optional when the transcript exposes which client hosted the run. */
+		harness?: AgentHarness;
 	};
 	/** User pinned this conversation in the chat sidebar — keeps it at the top.
 	 *  Persists across app restarts via the on-disk conversation file. */
@@ -288,6 +293,14 @@ export interface ChatHistoryStore {
 
 // Extend SettingsStore with fields added before Rust types are regenerated
 export type Settings = SettingsStore & {
+	/** Enable account data sync for this device. Default false. */
+	dataSyncEnabled?: boolean;
+	/** Friendly name used to partition this device's synced data. */
+	dataSyncDeviceName?: string;
+	/** Start boundary for this device's current explicit opt-in. */
+	dataSyncEnabledAt?: string;
+	/** Account that explicitly enabled Data Sync on this device. */
+	dataSyncAccountId?: string;
 	/** Enable automatic Activities generation. Default false. */
 	activitiesEnabled?: boolean;
 	/** Native Activity generation cadence in minutes. Default 15. */
@@ -313,7 +326,6 @@ export type Settings = SettingsStore & {
 	remoteControlPolicy?: DesktopRemotePolicySnapshot;
 	updateChannel?: UpdateChannel;
 	chatHistory?: ChatHistoryStore;
-	ignoredUrls?: string[];
 	/**
 	 * Entries the capture-category switches created, so turning a category off
 	 * removes only those and never a rule the user wrote by hand.
@@ -446,11 +458,6 @@ export type Settings = SettingsStore & {
 	 *  Meetings ships hidden, which is what puts its compact icon in the
 	 *  top-left chrome strip instead. See `lib/utils/sidebar-nav-layout`. */
 	sidebarNavLayout?: SidebarNavLayout;
-	/** Rollout gate for right-click + drag sidebar customization. Owned by the
-	 *  typed PostHog registry (`sidebar-customization-control`); a persisted
-	 *  layout is still honored when the gate is off, so turning the flag off
-	 *  removes the editing affordances without resetting anyone's sidebar. */
-	enableSidebarCustomization?: boolean;
 	/** Show the chat suggestion chips above the input — the "follow up"
 	 *  questions and the connection-aware suggested prompts. The single inline
 	 *  X on the chips flips this to false; re-enable from Settings → Display.
@@ -704,6 +711,7 @@ const applyProCloudAudioDefaults = (settings: Settings): Settings => {
 };
 
 let DEFAULT_SETTINGS: Settings = {
+			dataSyncEnabled: false,
 			activitiesEnabled: false,
 			activitiesIntervalMinutes: 15,
 			aiPresets: makeDefaultPresets(false) as any,
@@ -740,6 +748,7 @@ let DEFAULT_SETTINGS: Settings = {
 			],
 			includedWindows: [],
 			ignoredUrls: [],
+			includedUrls: [],
 			ignoredMeetingApps: [],
 			teamFilters: { ignoredWindows: [], includedWindows: [], ignoredUrls: [] },
 
@@ -817,7 +826,6 @@ let DEFAULT_SETTINGS: Settings = {
 			meetingSummaryPipeSlug: "meeting-summary",
 			filterMusic: true,
 			prioritizeInputLatency: false,
-			enableSidebarCustomization: false,
 			allowHidingShortcutOverlay: false,
 			showShortcutOverlay: true,
 			shortcutOverlaySnoozedUntil: null,
@@ -1568,6 +1576,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	// Install global fetch interceptor to catch 401s from screenpipe.com
 	const settingsRef = useRef(settings);
 	settingsRef.current = settings;
+	const settingsUpdateGenerationRef = useRef(0);
 
 	// Monotonic auth generation, bumped on every explicit sign-out. A
 	// loadUser() call snapshots this at entry; if a sign-out bumps it while the
@@ -1782,6 +1791,15 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	}, [settings.fontSize]);
 
 	const updateSettings = async (updates: Partial<Settings>) => {
+		const updateGeneration = ++settingsUpdateGenerationRef.current;
+		const settingsBeforeUpdate = settingsRef.current;
+
+		// Controlled switches and checkboxes must reflect the click immediately.
+		// Waiting for the asynchronous store listener makes React render the old
+		// value again, so the first click appears to undo itself. Persistence stays
+		// authoritative: a failed latest write is rolled back below.
+		setSettings((current) => ({ ...current, ...updates }) as Settings);
+
 		// Every settings mutation funnels through here, which makes this the one
 		// place that can answer "which controls do people actually change" without
 		// wiring ~40 call sites. The payload is redacted to booleans and numbers
@@ -1805,7 +1823,20 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			// session. Fire-and-forget; the listener above bumps each window's ref.
 			emit("screenpipe-auth-signout").catch(() => {});
 		}
-		await settingsStore.set(updates);
+		try {
+			await settingsStore.set(updates);
+		} catch (error) {
+			// Do not let an older failed write overwrite a newer optimistic click.
+			// The queued newer write (and its store event) owns reconciliation.
+			if (settingsUpdateGenerationRef.current === updateGeneration) {
+				try {
+					setSettings(await settingsStore.get());
+				} catch {
+					setSettings(settingsBeforeUpdate);
+				}
+			}
+			throw error;
+		}
 		// Settings will be updated via the listener
 		if (clearsAccount) {
 			// Account changes must not alter the user's local retention policy.

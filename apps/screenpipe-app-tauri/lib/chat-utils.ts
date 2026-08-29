@@ -110,7 +110,11 @@ export function extractInjectedUserText(value?: string | null): string | null {
  * render as "untitled" instead of leaking the raw blob into the sidebar.
  */
 export function isInjectedTitle(value?: string | null): value is string {
-  return isConversationHistorySyncPrompt(value) || isConnectionsContextPrompt(value);
+  if (typeof value !== "string") return false;
+  const trimmed = value.trimStart();
+  return trimmed.startsWith("<conversation_history>")
+    || trimmed.startsWith("<connections_context>")
+    || trimmed.startsWith("<screenpipe-system-context>");
 }
 
 // ============================================================================
@@ -129,6 +133,8 @@ export interface ChatPrefillData {
   source?: string;
   /** Open the Home window chat instead of the Chat overlay. */
   useHomeChat?: boolean;
+  /** Show this local artifact beside the editable composer. */
+  filePreviewPath?: string;
 }
 
 export type ChatTargetWindow = "home" | "chat";

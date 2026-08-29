@@ -323,6 +323,44 @@ jobs:
           echo "CODESIGNTOOL_PATH=$cstDest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "CodeSignTool installed at $cstDest"
 
+      - name: Build and sign Windows persistence helpers
+        working-directory: apps/screenpipe-app-tauri
+        shell: pwsh
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+        run: |
+          bun run build:persistence-supervisor --target x86_64-pc-windows-msvc
+
+          $target = "src-tauri\target\x86_64-pc-windows-msvc\release"
+          $supervisor = Join-Path $target "screenpipe-persistence-supervisor.exe"
+          $remover = Join-Path $target "remove-screenpipe-persistence.exe"
+          $manifest = "src-tauri\windows\persistence-supervisor\persistence.manifest"
+          foreach ($path in @($supervisor, $remover, $manifest)) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "Missing persistence build input: $path" }
+          }
+
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" -File |
+            Sort-Object FullName |
+            Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $mt) { throw "Windows SDK mt.exe was not found" }
+          & $mt -nologo -manifest $manifest "-outputresource:$remover;#1"
+          if ($LASTEXITCODE -ne 0) { throw "mt.exe failed to embed the remover elevation manifest" }
+
+          & powershell -ExecutionPolicy Bypass -File src-tauri\sign-ssl.ps1 $supervisor
+          if ($LASTEXITCODE -ne 0) { throw "Could not sign persistence supervisor" }
+          & powershell -ExecutionPolicy Bypass -File src-tauri\sign-ssl.ps1 $remover
+          if ($LASTEXITCODE -ne 0) { throw "Could not sign persistence removal tool" }
+
+          foreach ($path in @($supervisor, $remover)) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            if ($signature.Status -ne 'Valid') {
+              throw "Persistence helper signature is $($signature.Status): $path"
+            }
+          }
+
       - name: Build (enterprise, Windows x64)
         uses: tauri-apps/tauri-action@v0.5.17
         env:
@@ -384,11 +422,61 @@ jobs:
             throw "Tauri updater signature is empty: $($updaterSignature.FullName)"
           }
 
+      - name: Bundle persistent enterprise installer
+        working-directory: apps/screenpipe-app-tauri
+        shell: pwsh
+        env:
+          CI: true
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+        run: |
+          $target = "x86_64-pc-windows-msvc"
+          $nsisDir = "src-tauri\target\$target\release\bundle\nsis"
+          $savedStandard = Join-Path $env:RUNNER_TEMP "screenpipe-standard-nsis"
+          if (Test-Path -LiteralPath $savedStandard) {
+            Remove-Item -LiteralPath $savedStandard -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $savedStandard | Out-Null
+          Get-ChildItem -LiteralPath $nsisDir -File | Move-Item -Destination $savedStandard
+
+          bun run bundle:persistence-installer
+          if ($LASTEXITCODE -ne 0) { throw "Persistent NSIS bundle failed" }
+
+          $generated = Get-ChildItem -LiteralPath $nsisDir -Filter *.exe -File
+          if ($generated.Count -ne 1) {
+            throw "Expected one persistent installer, found $($generated.Count)"
+          }
+          $version = (Select-String -Path src-tauri\Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $persistent = Join-Path $nsisDir "screenpipe-enterprise-$version-x64-persistent.exe"
+          Move-Item -LiteralPath $generated[0].FullName -Destination $persistent
+          Get-ChildItem -LiteralPath $savedStandard -File | Move-Item -Destination $nsisDir
+
+          powershell -ExecutionPolicy Bypass -File src-tauri\sign-ssl.ps1 $persistent
+          if ($LASTEXITCODE -ne 0) { throw "Persistent installer signing failed" }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $persistent
+          if ($signature.Status -ne 'Valid') {
+            throw "Persistent installer signature is $($signature.Status): $persistent"
+          }
+
       - name: Create .intunewin
         shell: pwsh
         run: |
           cd apps/screenpipe-app-tauri
-          try { .\scripts\exe-to-intunewin.ps1 } catch { Write-Host ".intunewin creation failed: $_" }
+          try {
+            $nsisDir = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis"
+            $outRoot = "scripts\intunewin\out"
+            if (Test-Path -LiteralPath $outRoot) { Remove-Item -LiteralPath $outRoot -Recurse -Force }
+            $persistent = Get-ChildItem -LiteralPath $nsisDir -Filter *-persistent.exe -File | Select-Object -First 1
+            $standard = Get-ChildItem -LiteralPath $nsisDir -Filter *.exe -File |
+              Where-Object { $_.Name -notlike '*-persistent.exe' } |
+              Select-Object -First 1
+            if (-not $standard -or -not $persistent) { throw "Both standard and persistent installers are required" }
+            .\scripts\exe-to-intunewin.ps1 -SetupExe $standard.FullName -OutDir "$outRoot\standard"
+            .\scripts\exe-to-intunewin.ps1 -SetupExe $persistent.FullName -OutDir "$outRoot\persistent"
+          } catch { Write-Host ".intunewin creation failed: $_" }
 
       - name: Upload enterprise Windows artifacts
         if: github.event.inputs.dry_run != 'true'
@@ -404,7 +492,7 @@ jobs:
             "${BUNDLE_DIR}"/nsis/*.exe \
             "${BUNDLE_DIR}"/nsis/*.nsis.zip \
             "${BUNDLE_DIR}"/nsis/*.sig \
-            apps/screenpipe-app-tauri/scripts/intunewin/out/*.intunewin
+            apps/screenpipe-app-tauri/scripts/intunewin/out/**/*.intunewin
 
       - name: Upload enterprise NSIS installer (artifact)
         uses: actions/upload-artifact@v4
@@ -770,6 +858,9 @@ jobs:
           echo "/opt/homebrew/bin" >> $GITHUB_PATH
           echo "/opt/homebrew/sbin" >> $GITHUB_PATH
           brew install ffmpeg wget
+          if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
+            brew install python
+          fi
 
       - name: Run pre_build.js
         env:
@@ -990,6 +1081,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          DMGBUILD_VENV="$RUNNER_TEMP/dmgbuild-venv"
+          python3 -m venv "$DMGBUILD_VENV"
+          "$DMGBUILD_VENV/bin/pip" install --disable-pip-version-check "dmgbuild==1.6.7"
+          export PATH="$DMGBUILD_VENV/bin:$PATH"
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
           VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' apps/screenpipe-app-tauri/src-tauri/Cargo.toml | head -1)
@@ -1160,7 +1255,7 @@ jobs:
             echo "${APP_NAME}.tar.gz passes updater archive verification"
           done
 
-      - name: Build .pkg for Intune/MDM deployment
+      - name: Build standard and persistent enterprise .pkg installers
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -1201,30 +1296,62 @@ jobs:
             exit 1
           fi
 
-          # Create an unsigned component package first so the package receipt
-          # keeps a stable identifier, then sign the final product archive with
-          # Developer ID Installer.
-          PKG_OUTPUT="${PKG_DIR}/screenpipe-enterprise-${VERSION}-${PACKAGE_ARCH}.pkg"
-          COMPONENT_PKG="${PKG_DIR}/screenpipe-enterprise-${VERSION}-${PACKAGE_ARCH}-component.pkg"
+          # Keep the existing component package unchanged, and additionally
+          # offer a persistent package with root-owned launchd supervision.
+          STANDARD_PKG="${PKG_DIR}/screenpipe-enterprise-${VERSION}-${PACKAGE_ARCH}.pkg"
+          STANDARD_COMPONENT="${PKG_DIR}/screenpipe-enterprise-${VERSION}-${PACKAGE_ARCH}-component.pkg"
+          PERSISTENT_PKG="${PKG_DIR}/screenpipe-enterprise-${VERSION}-${PACKAGE_ARCH}-persistent.pkg"
+          PERSISTENT_COMPONENT="${PKG_DIR}/screenpipe-enterprise-${VERSION}-${PACKAGE_ARCH}-persistent-component.pkg"
+          PERSISTENCE_DIR="apps/screenpipe-app-tauri/src-tauri/macos/persistence"
 
-          echo "Building component .pkg..."
+          echo "Building standard component .pkg..."
           pkgbuild \
             --component "$APP_PATH" \
             --install-location /Applications \
             --identifier "screenpi.pe.enterprise" \
             --version "$VERSION" \
-            "$COMPONENT_PKG"
+            "$STANDARD_COMPONENT"
 
           echo "Signing product .pkg with: $INSTALLER_IDENTITY"
           productbuild \
-            --package "$COMPONENT_PKG" \
+            --package "$STANDARD_COMPONENT" \
             --sign "$INSTALLER_IDENTITY" \
             --timestamp \
-            "$PKG_OUTPUT"
-          rm -f "$COMPONENT_PKG"
+            "$STANDARD_PKG"
 
-          echo "Distribution pkg created: $(basename "$PKG_OUTPUT")"
-          pkgutil --check-signature "$PKG_OUTPUT"
+          echo "Building persistent component .pkg..."
+          PERSISTENT_ROOT=$(mktemp -d)
+          mkdir -p "${PERSISTENT_ROOT}/Applications"
+          ditto "$APP_PATH" "${PERSISTENT_ROOT}/Applications/$(basename "$APP_PATH")"
+          ditto "${PERSISTENCE_DIR}/payload" "$PERSISTENT_ROOT"
+          chmod 755 \
+            "${PERSISTENT_ROOT}/Library/PrivilegedHelperTools/screenpipe-persistence-supervisor" \
+            "${PERSISTENT_ROOT}/Library/PrivilegedHelperTools/screenpipe-persistence-uninstall" \
+            "${PERSISTENCE_DIR}/scripts/preinstall" \
+            "${PERSISTENCE_DIR}/scripts/postinstall"
+          chmod 644 \
+            "${PERSISTENT_ROOT}/Library/LaunchAgents/screenpi.pe.enterprise.persistence.plist" \
+            "${PERSISTENT_ROOT}/Library/LaunchDaemons/screenpi.pe.enterprise.persistence-supervisor.plist"
+          pkgbuild \
+            --root "$PERSISTENT_ROOT" \
+            --scripts "${PERSISTENCE_DIR}/scripts" \
+            --ownership recommended \
+            --identifier "screenpi.pe.enterprise.persistence" \
+            --version "$VERSION" \
+            "$PERSISTENT_COMPONENT"
+          rm -rf "$PERSISTENT_ROOT"
+
+          productbuild \
+            --package "$PERSISTENT_COMPONENT" \
+            --sign "$INSTALLER_IDENTITY" \
+            --timestamp \
+            "$PERSISTENT_PKG"
+          rm -f "$STANDARD_COMPONENT" "$PERSISTENT_COMPONENT"
+
+          for package in "$STANDARD_PKG" "$PERSISTENT_PKG"; do
+            echo "Distribution pkg created: $(basename "$package")"
+            pkgutil --check-signature "$package"
+          done
 
           # Notarize the .pkg. Retry transient notary failures: Apple's service
           # occasionally fast-fails a submission (enterprise v2.5.80, build
@@ -1232,41 +1359,43 @@ jobs:
           # succeeded, so creds/agreement were fine). The `if VAR=$(...)` form
           # also keeps `set -e` from aborting at the assignment before we can
           # print the output / retry; the "status: Accepted" gate below is final.
-          echo "Notarizing .pkg..."
-          SUBMIT_OUT=""
-          for attempt in 1 2 3; do
-            if SUBMIT_OUT=$(xcrun notarytool submit "$PKG_OUTPUT" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait --timeout 15m 2>&1); then :; fi
-            echo "$SUBMIT_OUT"
-            if echo "$SUBMIT_OUT" | grep -q "status: Accepted"; then
-              break
-            fi
-            echo "Notarization attempt $attempt/3 did not return Accepted."
-            [ "$attempt" -lt 3 ] && { echo "Retrying in $((attempt * 30))s..."; sleep $((attempt * 30)); }
-          done
-
-          # Extract submission ID and check result
-          SUBMISSION_ID=$(echo "$SUBMIT_OUT" | grep "id:" | head -1 | awk '{print $2}' || true)
-          if ! echo "$SUBMIT_OUT" | grep -q "status: Accepted"; then
-            echo "Notarization FAILED — fetching log for details..."
-            if [ -n "$SUBMISSION_ID" ]; then
-              xcrun notarytool log "$SUBMISSION_ID" \
+          for PKG_OUTPUT in "$STANDARD_PKG" "$PERSISTENT_PKG"; do
+            echo "Notarizing $(basename "$PKG_OUTPUT")..."
+            SUBMIT_OUT=""
+            for attempt in 1 2 3; do
+              if SUBMIT_OUT=$(xcrun notarytool submit "$PKG_OUTPUT" \
                 --apple-id "$APPLE_ID" \
                 --password "$APPLE_PASSWORD" \
-                --team-id "$APPLE_TEAM_ID" 2>&1 || true
-            fi
-            echo "ERROR: Refusing to upload an unnotarized .pkg."
-            exit 1
-          fi
+                --team-id "$APPLE_TEAM_ID" \
+                --wait --timeout 15m 2>&1); then :; fi
+              echo "$SUBMIT_OUT"
+              if echo "$SUBMIT_OUT" | grep -q "status: Accepted"; then
+                break
+              fi
+              echo "Notarization attempt $attempt/3 did not return Accepted."
+              [ "$attempt" -lt 3 ] && { echo "Retrying in $((attempt * 30))s..."; sleep $((attempt * 30)); }
+            done
 
-          echo "Stapling .pkg..."
-          xcrun stapler staple "$PKG_OUTPUT"
-          xcrun stapler validate "$PKG_OUTPUT"
-          spctl --assess --type install --verbose "$PKG_OUTPUT"
-          echo ".pkg notarized and stapled: $(basename "$PKG_OUTPUT")"
+            # Extract submission ID and check result
+            SUBMISSION_ID=$(echo "$SUBMIT_OUT" | grep "id:" | head -1 | awk '{print $2}' || true)
+            if ! echo "$SUBMIT_OUT" | grep -q "status: Accepted"; then
+              echo "Notarization FAILED — fetching log for details..."
+              if [ -n "$SUBMISSION_ID" ]; then
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --apple-id "$APPLE_ID" \
+                  --password "$APPLE_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" 2>&1 || true
+              fi
+              echo "ERROR: Refusing to upload an unnotarized .pkg."
+              exit 1
+            fi
+
+            echo "Stapling $(basename "$PKG_OUTPUT")..."
+            xcrun stapler staple "$PKG_OUTPUT"
+            xcrun stapler validate "$PKG_OUTPUT"
+            spctl --assess --type install --verbose "$PKG_OUTPUT"
+            echo ".pkg notarized and stapled: $(basename "$PKG_OUTPUT")"
+          done
 
       - name: Upload to R2
         if: github.event.inputs.dry_run != 'true'

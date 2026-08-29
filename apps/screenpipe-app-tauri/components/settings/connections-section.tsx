@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogClose, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Download, ExternalLink, Check, Loader2, Copy, Terminal, LogIn, LogOut, RotateCw, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen, Plus, AlertCircle, MessageSquare, Inbox, ChevronDown } from "lucide-react";
+import { Download, ExternalLink, Check, Loader2, Copy, Terminal, LogIn, LogOut, RotateCw, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen, Plus, AlertCircle, MessageSquare, Inbox, ChevronDown, Bird } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { commands } from "@/lib/utils/tauri";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -263,6 +263,7 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
       addIf("notion", macAppExists("Notion")),
       addIf("linear", macAppExists("Linear")),
       addIf("perplexity", macAppExists("Perplexity")),
+      addIf("littlebird", macAppExists("Littlebird")),
       addIf("krisp", macAppExists("Krisp")),
       addIf("codex", getCodexConfigPath().then(pathExists)),
       addIf("grok", getGrokConfigPath().then(pathExists)),
@@ -329,6 +330,11 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
       addIf("perplexity", anyPathExists([
         local("Programs", "Perplexity", "Perplexity.exe"),
         ...windowsApps("Perplexity.exe"),
+      ])),
+      addIf("littlebird", anyPathExists([
+        local("Programs", "Littlebird", "Littlebird.exe"),
+        roaming("Littlebird"),
+        ...windowsApps("Littlebird.exe"),
       ])),
       addIf("krisp", anyPathExists([
         local("Programs", "Krisp", "Krisp.exe"),
@@ -576,6 +582,7 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
     quickbooks: <img src="/images/quickbooks.svg" alt="QuickBooks Online" className="w-5 h-5" />,
     notion: <img src="/images/notion.svg" alt="Notion" className="w-5 h-5 dark:invert" />,
     linear: <img src="/images/linear.svg" alt="Linear" className="w-5 h-5" />,
+    littlebird: <Bird className="h-5 w-5 text-foreground" aria-label="Littlebird" />,
     krisp: <img src="/images/krisp.svg" alt="Krisp" className="w-5 h-5 dark:invert" />,
     plaud: <img src="/images/plaud.png" alt="Plaud" className="w-5 h-5 dark:invert" />,
     excalidraw: <img src="/images/excalidraw.svg" alt="Excalidraw" className="w-5 h-5" />,
@@ -739,7 +746,7 @@ export const INTEGRATION_ICON_KEYS = new Set<string>(Object.keys(INTEGRATION_ICO
 
 export function IntegrationIcon({
   icon,
-  className = "w-10 h-10 bg-muted rounded-xl flex items-center justify-center",
+  className = "w-10 h-10 bg-muted rounded-lg flex items-center justify-center",
   fallbackClassName = "h-5 w-5 text-muted-foreground",
 }: {
   icon: string;
@@ -784,6 +791,7 @@ export const TRY_IN_CHAT_PROMPTS: Record<string, string> = {
   gmail: "Summarize my recent emails",
   "google-drive": "Find my recent files in Google Drive",
   "google-sheets": "What's in my latest spreadsheet?",
+  littlebird: "Search my Littlebird memory for recent decisions and meetings",
   krisp: "Search my meeting transcripts for action items",
   excalidraw: "What's on my recent Excalidraw boards?",
   whatsapp: "What were the latest messages in my WhatsApp?",
@@ -826,7 +834,7 @@ function ListRow({ tile, selected, onClick, onTryInChat }: {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); }
       }}
       className={`
-        group/row flex w-full items-center gap-3 px-3 py-3 rounded-xl border transition-all text-left cursor-pointer select-none
+        group/row flex w-full items-center gap-3 px-3 py-3 rounded-lg border transition-all text-left cursor-pointer select-none
         ${selected
           ? "border-foreground bg-accent"
           : "border-transparent hover:bg-accent/50 hover:border-border"
@@ -868,7 +876,7 @@ function ListRow({ tile, selected, onClick, onTryInChat }: {
             </TooltipProvider>
           </>
         ) : (
-          <div className="absolute inset-0 rounded-xl bg-muted flex items-center justify-center">
+          <div className="absolute inset-0 rounded-lg bg-muted flex items-center justify-center">
             <Plus className="h-4 w-4 text-foreground" />
           </div>
         )}
@@ -895,7 +903,7 @@ function McpSpotlight({
   return (
     <div
       className={`
-        rounded-xl border bg-card p-3 transition-colors
+        rounded-lg border bg-card p-3 transition-colors
         ${selected ? "border-foreground bg-accent" : "border-border"}
       `}
     >
@@ -944,7 +952,7 @@ function AiToolsSpotlight({
   return (
     <div
       className={`
-        rounded-xl border bg-card p-3 transition-colors
+        rounded-lg border bg-card p-3 transition-colors
         ${selected ? "border-foreground bg-accent" : "border-border"}
       `}
     >
@@ -993,7 +1001,7 @@ function SkillsSpotlight({
   return (
     <div
       className={`
-        rounded-xl border bg-card p-3 transition-colors
+        rounded-lg border bg-card p-3 transition-colors
         ${selected ? "border-foreground bg-accent" : "border-border"}
       `}
     >
@@ -2227,6 +2235,20 @@ const OAUTH_SCOPE_VARIANTS: Record<
   ],
 };
 
+export function getOAuthPanelCopy(integrationId: string, integrationName: string) {
+  if (integrationId === "slack") {
+    return {
+      description: "Connect a Slack workspace. Add each workspace where Screenpipe should act on your behalf.",
+      addAnotherLabel: "add another workspace",
+    };
+  }
+
+  return {
+    description: `Connect your ${integrationName} account. AI can act on your behalf once connected.`,
+    addAnotherLabel: "add another account",
+  };
+}
+
 export function getOAuthFallbackMessage(
   integrationId: string,
   phase: "pending" | "failed",
@@ -2283,6 +2305,7 @@ function OAuthPanel({
     ? initialScopeVariant!
     : scopeVariants?.[0]?.id ?? null;
   const [scopeVariant, setScopeVariant] = useState(defaultScopeVariant);
+  const panelCopy = getOAuthPanelCopy(integrationId, integrationName);
 
   const clearFallbackTimer = useCallback(() => {
     if (fallbackTimerRef.current) {
@@ -2404,7 +2427,7 @@ function OAuthPanel({
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Connect your {integrationName} account. AI can act on your behalf once connected.
+        {panelCopy.description}
       </p>
       {connected && (
         <div className="space-y-2">
@@ -2478,7 +2501,7 @@ function OAuthPanel({
         ) : (
           <Button onClick={handleConnect} disabled={connectDisabled} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal whitespace-nowrap">
             {connected && supportsOAuthInstances
-              ? (<><Plus className="h-3 w-3" />add another account</>)
+              ? (<><Plus className="h-3 w-3" />{panelCopy.addAnotherLabel}</>)
               : connected
                 ? (<><LogIn className="h-3 w-3" />reconnect {integrationName}</>)
               : (<><LogIn className="h-3 w-3" />connect with {integrationName}</>)}
@@ -3223,7 +3246,7 @@ export function ApiIntegrationPanel({ integration, onRefresh }: {
 }
 
 // ---------------------------------------------------------------------------
-// Featured OAuth MCP cards (Krisp, Plaud)
+// Featured OAuth MCP cards
 // ---------------------------------------------------------------------------
 //
 // Some providers expose their data (meeting transcripts, recordings, notes)
@@ -3236,6 +3259,7 @@ export function ApiIntegrationPanel({ integration, onRefresh }: {
 
 const KRISP_MCP_URL = "https://mcp.krisp.ai/mcp";
 const PLAUD_MCP_URL = "https://mcp.plaud.ai/mcp";
+const LITTLEBIRD_MCP_URL = "https://mcp.littlebird.ai/mcp";
 // Providers that run a first-party remote MCP server whose OAuth supports
 // Dynamic Client Registration (RFC 7591). For these, the tile connects in
 // one click via OAuthMcpPanel — no API key and no human-created
@@ -3261,6 +3285,18 @@ export const MCP_OAUTH_PROVIDERS: {
   { id: "confluence", name: "Confluence", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and edit your Confluence pages (and Jira issues). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
   { id: "jira", name: "Jira", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and manage your Jira issues (and Confluence pages). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
   { id: "notion", name: "Notion", url: "https://mcp.notion.com/mcp", description: <>Connect Notion so your AI can search, read, and write your pages and databases. Sign-in uses Notion&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  {
+    id: "littlebird",
+    name: "Littlebird",
+    url: LITTLEBIRD_MCP_URL,
+    description: (
+      <>
+        Connect Littlebird so your AI can search your existing Littlebird memory
+        while Screenpipe builds new local history. This links access; it does not
+        copy or delete data. Enable MCP in Littlebird before signing in.
+      </>
+    ),
+  },
 ];
 
 export function isMcpOAuthProviderTileConnected(
@@ -4005,6 +4041,7 @@ export function ConnectionsSection({
       { id: "notion", name: "Notion", icon: "notion", connected: false, detected: detectedConnectionIds.has("notion") },
       { id: "linear", name: "Linear", icon: "linear", connected: false, detected: detectedConnectionIds.has("linear") },
       { id: "perplexity", name: "Perplexity", icon: "perplexity", connected: false, detected: detectedConnectionIds.has("perplexity") },
+      { id: "littlebird", name: "Littlebird", icon: "littlebird", connected: !!mcpProviderConnected.littlebird, detected: detectedConnectionIds.has("littlebird") },
       { id: "krisp", name: "Krisp", icon: "krisp", connected: krispConnected, detected: detectedConnectionIds.has("krisp") },
       { id: "plaud", name: "Plaud", icon: "plaud", connected: plaudConnected },
       { id: "excalidraw", name: "Excalidraw", icon: "excalidraw", connected: excalidrawConnected },

@@ -3492,7 +3492,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -4207,6 +4207,15 @@ checksum = "38e2275cc4e4fc009b0669731a1e5ab7ebf11f469eaede2bab9309a5b4d6057f"
 dependencies = [
  "memoffset",
  "rustc_version",
+]
+
+[[package]]
+name = "file-id"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1fc6a637b6dc58414714eddd9170ff187ecb0933d4c7024d1abbd23a3cc26e9"
+dependencies = [
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5905,7 +5914,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -6720,9 +6729,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libdbus-sys"
@@ -6906,25 +6915,6 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
-]
-
-[[package]]
-name = "libxdo"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00333b8756a3d28e78def82067a377de7fa61b24909000aeaa2b446a948d14db"
-dependencies = [
- "libxdo-sys",
-]
-
-[[package]]
-name = "libxdo-sys"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db23b9e7e2b7831bbd8aac0bbeeeb7b68cbebc162b227e7052e8e55829a09212"
-dependencies = [
- "libc",
- "x11",
 ]
 
 [[package]]
@@ -7589,7 +7579,6 @@ dependencies = [
  "dpi",
  "gtk",
  "keyboard-types",
- "libxdo",
  "objc2 0.6.4",
  "objc2-app-kit",
  "objc2-core-foundation",
@@ -7865,6 +7854,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "notify-debouncer-full"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "375bd3a138be7bfeff3480e4a623df4cbfb55b79df617c055cd810ba466fa078"
+dependencies = [
+ "file-id",
+ "log",
+ "notify",
+ "notify-types",
+ "walkdir",
+]
+
+[[package]]
 name = "notify-rust"
 version = "4.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7885,6 +7887,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
  "bitflags 2.11.0",
+ "serde",
 ]
 
 [[package]]
@@ -8039,7 +8042,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -11083,7 +11086,7 @@ dependencies = [
 [[package]]
 name = "sck-rs"
 version = "0.1.0"
-source = "git+https://github.com/screenpipe/sck-rs?rev=b372bd25e9164b45331a290ce4f3f9801bf506f3#b372bd25e9164b45331a290ce4f3f9801bf506f3"
+source = "git+https://github.com/screenpipe/sck-rs?rev=758ee8b826763cba68da6eb3d204e8ba2d357109#758ee8b826763cba68da6eb3d204e8ba2d357109"
 dependencies = [
  "cidre 0.16.1 (git+https://github.com/yury/cidre.git?rev=9c20f5ee5abaad4598843a33e13d6e48822d1f30)",
  "image 0.25.10",
@@ -11140,7 +11143,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-app"
-version = "2.6.80"
+version = "2.7.5"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -11180,7 +11183,6 @@ dependencies = [
  "log",
  "minisign",
  "minisign-verify",
- "muda",
  "nokhwa-bindings-macos",
  "notify",
  "objc",
@@ -11274,7 +11276,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-audio"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "anyhow",
  "audiopipe",
@@ -11316,6 +11318,7 @@ dependencies = [
  "screenpipe-events",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sonora",
  "sqlx",
  "symphonia",
@@ -11324,6 +11327,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
+ "uuid",
  "vad-rs",
  "webrtc-vad",
  "which 7.0.3",
@@ -11352,7 +11356,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-config"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "dirs 6.0.0",
  "screenpipe-cpu-features",
@@ -11365,7 +11369,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-connect"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -11411,7 +11415,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-core"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -11464,11 +11468,11 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-cpu-features"
-version = "0.4.44"
+version = "0.4.46"
 
 [[package]]
 name = "screenpipe-db"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11496,7 +11500,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-engine"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -11570,7 +11574,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-events"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11586,7 +11590,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-overlay-win"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -11596,8 +11600,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "screenpipe-persistence-supervisor"
+version = "0.1.0"
+dependencies = [
+ "windows 0.58.0",
+ "windows-service",
+]
+
+[[package]]
 name = "screenpipe-redact"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -11634,7 +11646,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-resource"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "serde",
  "sysinfo",
@@ -11654,7 +11666,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-screen"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "accessibility-sys",
  "anyhow",
@@ -11721,7 +11733,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sqlite-coordinator"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "libsqlite3-sys",
  "serde",
@@ -11734,7 +11746,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sqlite-recovery"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "cc",
  "libsqlite3-sys",
@@ -11742,7 +11754,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sync"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -11762,7 +11774,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-telemetry-wire"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "serde",
  "serde_json",
@@ -11772,7 +11784,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-vault"
-version = "0.4.44"
+version = "0.4.46"
 dependencies = [
  "argon2 0.5.3",
  "chacha20poly1305",
@@ -14075,6 +14087,8 @@ dependencies = [
  "anyhow",
  "dunce",
  "glob",
+ "notify",
+ "notify-debouncer-full",
  "percent-encoding",
  "schemars 0.8.22",
  "serde",
@@ -16650,6 +16664,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags 2.11.0",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

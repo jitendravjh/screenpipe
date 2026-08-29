@@ -40,6 +40,7 @@ use updates::start_update_check;
 use window::ShowRewindWindow;
 
 mod activity_history;
+mod first_run_summary;
 mod analytics;
 mod auth_session;
 #[allow(deprecated)]
@@ -53,8 +54,10 @@ mod calendar;
 mod capture_session;
 mod chat_control;
 mod chatgpt_oauth;
+mod coding_workspace;
 #[allow(deprecated)]
 mod commands;
+mod data_sync;
 mod db_recovery_notifications;
 mod db_relaunch;
 mod db_self_heal;
@@ -90,6 +93,7 @@ mod ics_calendar;
 mod livetext;
 #[cfg(target_os = "macos")]
 mod livetext_ffi;
+mod enterprise_persistence;
 mod meeting_export;
 mod meeting_live_notes;
 mod meeting_stall_notifications;
@@ -108,6 +112,7 @@ mod permissions;
 mod pi;
 mod pi_command_queue;
 mod power_awake;
+mod port_conflict;
 mod process_exit;
 mod provider_automations;
 mod recording;
@@ -123,8 +128,6 @@ mod store;
 mod suggestions;
 mod sync;
 mod tray;
-#[cfg(target_os = "macos")]
-mod tray_monitor_preview;
 #[cfg(target_os = "macos")]
 mod staged_update;
 mod stale_tier;
@@ -259,6 +262,26 @@ fn should_skip_onboarding() -> bool {
 
 fn should_prevent_window_close(label: &str) -> bool {
     label != "onboarding"
+}
+
+#[cfg(target_os = "macos")]
+fn emit_menu_close_window(app: &tauri::AppHandle) {
+    let focused = app
+        .webview_windows()
+        .into_values()
+        .find(|window| window.is_focused().unwrap_or(false));
+    if let Some(window) = focused {
+        let _ = window.emit("menu-close-window", ());
+        return;
+    }
+    for label in ["home", "chat"] {
+        if let Some(window) = app.get_webview_window(label) {
+            if window.is_visible().unwrap_or(false) {
+                let _ = window.emit("menu-close-window", ());
+                return;
+            }
+        }
+    }
 }
 
 /// Flag passed by tauri-plugin-autostart when the OS launches us at login.
@@ -599,6 +622,11 @@ async fn main() {
             if resp.status().is_success() {
                 eprintln!("screenpipe: another instance is already running — focused existing window, exiting.");
                 std::process::exit(0);
+            } else if resp.status() == reqwest::StatusCode::CONFLICT {
+                // The control endpoint answered with Screenpipe's explicit
+                // cross-install rejection. Preserve that healthy instance;
+                // the bind path will report it instead of reclaiming its port.
+                crate::port_conflict::mark_healthy_control_server_present();
             }
         }
     }
@@ -907,6 +935,7 @@ async fn main() {
         wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
         cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
+        history_access: screenpipe_engine::history_access::HistoryAccessPolicy::unrestricted(),
         db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
@@ -1122,6 +1151,7 @@ async fn main() {
 
     let app = app.manage(recording_state)
         .manage(activity_history::ActivityHistoryState::default())
+        .manage(first_run_summary::FirstRunSummaryState::default())
         .manage(disk_pressure_notifications::DiskPressureNotificationState::default())
         .manage(pi_state)
         .manage(suggestions_state)
@@ -1212,16 +1242,20 @@ async fn main() {
                     .item(&PredefinedMenuItem::select_all(app, None)?)
                     .build()?;
 
-                // Standard Window menu so macOS key equivalents (Cmd-W close,
-                // Cmd-M minimize) work — without a menu item carrying the
-                // accelerator, AppKit silently swallows the keystroke. Close
-                // goes through the CloseRequested handler above, so Cmd-W
-                // hides to tray exactly like the red traffic-light button.
+                // Custom Close (not PredefinedMenuItem::close_window) so Cmd-W
+                // can close a chat tab first. The frontend listens for
+                // menu-close-window and hides the window only when no tab
+                // consumed the chord. Traffic-light close is unchanged.
+                // Cmd-M still needs a menu key equivalent or AppKit swallows it.
                 let window_submenu = SubmenuBuilder::new(app, "Window")
                     .item(&PredefinedMenuItem::minimize(app, None)?)
                     .item(&PredefinedMenuItem::maximize(app, None)?)
                     .separator()
-                    .item(&PredefinedMenuItem::close_window(app, None)?)
+                    .item(
+                        &MenuItemBuilder::with_id("close_window", "Close")
+                            .accelerator("CmdOrCtrl+W")
+                            .build(app)?,
+                    )
                     .build()?;
 
                 let menu = MenuBuilder::new(app)
@@ -1251,6 +1285,12 @@ async fn main() {
                         }
                         "quit_app" => {
                             process_exit::confirm_and_request_app_quit(app_handle.clone());
+                        }
+                        "close_window" => {
+                            let app = app_handle.clone();
+                            let _ = app_handle.run_on_main_thread(move || {
+                                emit_menu_close_window(&app);
+                            });
                         }
                         _ => {}
                     }
@@ -1384,6 +1424,10 @@ async fn main() {
             e2e::seeds::apply_settings(app.handle(), &mut store);
 
             app.manage(store.clone());
+            crate::recording::refresh_history_access_policy(
+                &app.state::<RecordingState>().history_access,
+                &store,
+            );
 
             // Set Chinese HuggingFace mirror early — before any model downloads
             if store.recording.use_chinese_mirror {
@@ -1848,6 +1892,7 @@ async fn main() {
                 let wants_recording = recording_state.wants_recording.clone();
                 let is_starting_clone = recording_state.is_starting.clone();
                 let cloud_token_arc = recording_state.cloud_token.clone();
+                let history_access = recording_state.history_access.clone();
                 // DB-wedge auto-recovery hook wiring — captured into the server
                 // thread so the freshly-built `ServerCore`'s DB gets the hook.
                 let app_for_db_wedge = app_handle.clone();
@@ -2002,12 +2047,19 @@ async fn main() {
                                 on_pipe_output,
                                 Some(owned_browser),
                                 cloud_token_arc.clone(),
+                                history_access.clone(),
                             )
                             .await
                             {
                                 Ok(s) => s,
                                 Err(e) => {
                                     error!("Failed to start server core: {}", e);
+                                    if crate::port_conflict::is_error(&e, config.port) {
+                                        crate::port_conflict::show_reclaim_failed(
+                                            &app_for_owned,
+                                            config.port,
+                                        );
+                                    }
                                     is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                                     return;
                                 }
@@ -2126,6 +2178,23 @@ async fn main() {
             // installed app registered exactly as it is.
             if crate::dev_isolation::is_active() {
                 debug!("dev isolation active, skipping autostart registration");
+            } else if crate::enterprise_persistence::installed() {
+                #[cfg(all(feature = "enterprise-build", target_os = "macos"))]
+                match enterprise_autostart::set_macos_employee_autostart(&app_handle, false) {
+                    Ok(()) => {
+                        info!("persistence: retired redundant employee startup registrations")
+                    }
+                    Err(error) => warn!(
+                        "persistence: could not retire redundant startup registrations: {error}"
+                    ),
+                }
+                #[cfg(all(feature = "enterprise-build", target_os = "windows"))]
+                match app_handle.autolaunch().disable() {
+                    Ok(()) => info!("persistence: retired redundant Windows startup registration"),
+                    Err(error) => warn!(
+                        "persistence: could not retire Windows startup registration: {error}"
+                    ),
+                }
             } else if is_autostart_enabled {
                 let _ = autostart_manager.enable();
             } else {
@@ -2216,19 +2285,33 @@ async fn main() {
                 let self_heal_app = app_handle.clone();
                 let self_heal_db_path = launch_db_path.clone();
                 let notify_data_dir = data_dir.clone();
-                let surface_recovery = !app_ui_hidden && !headless_startup;
+                let recovery_app = app_handle.clone();
+                let automatic_recovery = headless_startup;
                 tauri::async_runtime::spawn(async move {
                     if crate::db_self_heal::try_self_heal_at_launch(
                         self_heal_app,
                         self_heal_db_path,
+                        !automatic_recovery,
                     )
                     .await
                     {
                         return;
                     }
-                    crate::db_relaunch::surface_quarantined_recovery_at_launch(&launch_db_path)
-                        .await;
-                    if surface_recovery {
+                    crate::db_relaunch::surface_quarantined_recovery_at_launch(
+                        &launch_db_path,
+                        !automatic_recovery,
+                    )
+                    .await;
+                    if automatic_recovery {
+                        let recovery = crate::db_recovery_notifications::
+                            start_headless_quarantined_database_recovery(
+                                recovery_app,
+                                notify_data_dir,
+                            );
+                        if let Err(error) = recovery {
+                            error!("failed to start automatic protected database recovery: {error}");
+                        }
+                    } else {
                         crate::db_recovery_notifications::notify_quarantined_database(
                             notify_data_dir,
                         );
@@ -2237,6 +2320,7 @@ async fn main() {
             }
             crate::disk_pressure_notifications::start(app_handle.clone());
             activity_history::start(app_handle.clone());
+            first_run_summary::start(app_handle.clone());
 
             // Background ChatGPT OAuth token refresh — keeps access tokens
             // fresh so the lazy path in get_valid_token() rarely needs to
@@ -2334,6 +2418,10 @@ async fn main() {
             // Runs forever in background; only takes effect on enterprise-
             // telemetry builds with SCREENPIPE_ENTERPRISE_LICENSE_KEY env set.
             let _enterprise_shutdown_tx = enterprise_sync::spawn(&app_handle);
+
+            // Account data sync. Runtime eligibility keeps customer-managed
+            // Enterprise accounts out while allowing Screenpipe's own org.
+            data_sync::spawn(&app_handle);
 
             // Standard builds: account-bound, explicit opt-in support logs.
             // Enterprise builds compile this as a no-op because their managed

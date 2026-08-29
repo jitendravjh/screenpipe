@@ -68,7 +68,212 @@ vi.mock("@/components/usage/usage-popover", () => ({
 
 import { ComposerControlsRow } from "./composer-controls-row";
 
+const idleCodingWorkspace = {
+  workspace: null,
+  enabled: false,
+  isLoading: false,
+  error: null,
+  disabled: false,
+  onToggle: vi.fn(),
+};
+
+const activeCodingWorkspace = {
+  ...idleCodingWorkspace,
+  enabled: true,
+  workspace: {
+    version: 1,
+    conversationId: "conversation-a",
+    repoRoot: "/repos/screenpipe",
+    gitCommonDir: "/repos/screenpipe/.git",
+    worktreePath: "/worktrees/conversation-a",
+    branch: "screenpipe/chat-conversation-a",
+    baseCommit: "abc123",
+    sourceDirty: false,
+    createdAt: "2026-08-27T12:00:00.000Z",
+  },
+};
+
 describe("ComposerControlsRow", () => {
+  it("hides the idle worktree opt-in control", () => {
+    render(
+      <ComposerControlsRow
+        canChat
+        filters={
+          {
+            activeFilterCount: 0,
+            activeFilters: [],
+            activeFilterLabels: [],
+            hasActiveFilters: false,
+            appFilterOpen: false,
+            onFilterMenuOpenChange: vi.fn(),
+          } as any
+        }
+        modelControls={{
+          settings: { aiPresets: [] },
+          activePreset: null,
+          activePipeExecution: null,
+          currentQueueSessionId: null,
+          onSelectPreset: vi.fn(),
+          onPresetSaved: vi.fn(),
+        }}
+        codingWorkspace={idleCodingWorkspace}
+        isStreaming={false}
+        sendButton={{
+          isStopMode: false,
+          hasPendingDocs: false,
+          sendDisabled: false,
+          onStop: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(screen.queryByLabelText("worktree")).not.toBeInTheDocument();
+    expect(screen.queryByText("worktree")).not.toBeInTheDocument();
+  });
+
+  it("keeps existing worktree status visible without the checkbox", () => {
+    render(
+      <ComposerControlsRow
+        canChat
+        filters={
+          {
+            activeFilterCount: 0,
+            activeFilters: [],
+            activeFilterLabels: [],
+            hasActiveFilters: false,
+            appFilterOpen: false,
+            onFilterMenuOpenChange: vi.fn(),
+          } as any
+        }
+        modelControls={{
+          settings: { aiPresets: [] },
+          activePreset: null,
+          activePipeExecution: null,
+          currentQueueSessionId: null,
+          onSelectPreset: vi.fn(),
+          onPresetSaved: vi.fn(),
+        }}
+        codingWorkspace={activeCodingWorkspace}
+        isStreaming={false}
+        sendButton={{
+          isStopMode: false,
+          hasPendingDocs: false,
+          sendDisabled: false,
+          onStop: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(
+      screen.queryByTestId("coding-workspace-checkbox"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("coding-workspace-badge")).toHaveTextContent(
+      "screenpipe",
+    );
+  });
+
+  it("explains worktree preparation while the repository is being resolved", () => {
+    render(
+      <ComposerControlsRow
+        canChat={false}
+        filters={
+          {
+            activeFilterCount: 0,
+            activeFilters: [],
+            activeFilterLabels: [],
+            hasActiveFilters: false,
+            appFilterOpen: false,
+            onFilterMenuOpenChange: vi.fn(),
+          } as any
+        }
+        modelControls={{
+          settings: { aiPresets: [] },
+          activePreset: null,
+          activePipeExecution: null,
+          currentQueueSessionId: null,
+          onSelectPreset: vi.fn(),
+          onPresetSaved: vi.fn(),
+        }}
+        codingWorkspace={{
+          ...idleCodingWorkspace,
+          enabled: true,
+          isLoading: true,
+        }}
+        isStreaming={false}
+        sendButton={{
+          isStopMode: false,
+          hasPendingDocs: false,
+          sendDisabled: true,
+          onStop: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(screen.getByText("preparing worktree")).toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "preparing worktree" }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("pipe-ai-icon")).toHaveAttribute(
+      "data-live",
+      "true",
+    );
+    expect(
+      screen.queryByTestId("coding-workspace-checkbox"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a failed worktree explanation out of the compact controls row", () => {
+    render(
+      <ComposerControlsRow
+        canChat
+        filters={
+          {
+            activeFilterCount: 0,
+            activeFilters: [],
+            activeFilterLabels: [],
+            hasActiveFilters: false,
+            appFilterOpen: false,
+            onFilterMenuOpenChange: vi.fn(),
+          } as any
+        }
+        modelControls={{
+          settings: { aiPresets: [] },
+          activePreset: null,
+          activePipeExecution: null,
+          currentQueueSessionId: null,
+          onSelectPreset: vi.fn(),
+          onPresetSaved: vi.fn(),
+        }}
+        codingWorkspace={{
+          ...idleCodingWorkspace,
+          error: "The AI did not choose a repository in time",
+        }}
+        isStreaming={false}
+        sendButton={{
+          isStopMode: false,
+          hasPendingDocs: false,
+          sendDisabled: false,
+          onStop: vi.fn(),
+        }}
+      />,
+    );
+
+    expect(screen.queryByLabelText("worktree")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "worktree setup failed" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("The AI did not choose a repository in time"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "worktree setup failed" }),
+    );
+    expect(
+      screen.getByText("The AI did not choose a repository in time"),
+    ).toBeInTheDocument();
+  });
+
   it("uses an upward arrow for the send action", () => {
     render(
       <ComposerControlsRow
@@ -91,6 +296,7 @@ describe("ComposerControlsRow", () => {
           onSelectPreset: vi.fn(),
           onPresetSaved: vi.fn(),
         }}
+        codingWorkspace={idleCodingWorkspace}
         isStreaming={false}
         sendButton={{
           isStopMode: false,
@@ -142,6 +348,7 @@ describe("ComposerControlsRow", () => {
           onSelectPreset,
           onPresetSaved,
         }}
+        codingWorkspace={idleCodingWorkspace}
         isStreaming={false}
         sendButton={{
           isStopMode: false,
@@ -171,6 +378,7 @@ describe("ComposerControlsRow", () => {
         appFilterOpen: false,
         onFilterMenuOpenChange: vi.fn(),
       } as any,
+      codingWorkspace: idleCodingWorkspace,
       isStreaming: false,
       sendButton: {
         isStopMode: false,

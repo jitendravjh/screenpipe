@@ -12,7 +12,7 @@ import type {
 import type { QueuedDisplayPayload } from "@/lib/chat/types";
 import type { Suggestion } from "@/lib/hooks/use-auto-suggestions";
 import type { ExtractedDoc } from "@/lib/pi/extract-document";
-import type { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
+import type { AIPreset, CodingWorkspace, PiQueuedPrompt } from "@/lib/utils/tauri";
 
 type ActiveChatFilters = {
   timeRanges: { label: string }[];
@@ -90,6 +90,7 @@ export interface ComposerInputProps {
   chipPrefixWidth: number;
   chipScrollTop: number;
   onClearConnectionChip: () => void;
+  onValueChange: (value: string) => void;
   onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => void;
   onCompositionStart: () => void;
   onCompositionEnd: () => void;
@@ -172,11 +173,26 @@ export interface ComposerModelControlsProps {
   onReauthenticate?: () => void;
 }
 
+export interface ComposerCodingWorkspaceProps {
+  workspace: CodingWorkspace | null;
+  enabled: boolean;
+  isLoading: boolean;
+  error: string | null;
+  disabled: boolean;
+  onToggle: (checked: boolean) => void | Promise<void>;
+}
+
 export interface ComposerConnectBannerProps {
   show: boolean;
   suggestedConnectionTiles: ConnectionListItem[];
   onOpenConnectionSetup: (connectionId: string) => void | Promise<void>;
   onDismiss: () => void;
+}
+
+export interface ComposerJumpToLatestProps {
+  hasMessages: boolean;
+  scrolledUp: boolean;
+  onJump: () => void;
 }
 
 export interface ChatComposerProps {
@@ -188,6 +204,8 @@ export interface ChatComposerProps {
   mentions: ComposerMentionsProps;
   filters: ComposerFiltersProps;
   modelControls: ComposerModelControlsProps;
+  codingWorkspace: ComposerCodingWorkspaceProps;
   connectBanner: ComposerConnectBannerProps;
+  jumpToLatest?: ComposerJumpToLatestProps;
   onStop: () => void | Promise<void>;
 }

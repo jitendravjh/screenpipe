@@ -15,8 +15,11 @@ import { AcpConfigSelector } from "@/components/chat/standalone/acp-config-selec
 import { AcpPermissionSelector } from "@/components/chat/standalone/acp-permission-selector";
 import { ThinkingLevelSelector } from "@/components/thinking-level-selector";
 import { ComposerUtilityMenu } from "@/components/chat/standalone/composer-utility-menu";
+import { ComposerDictationControl } from "@/components/chat/standalone/composer-dictation-control";
 import { UsagePopover } from "@/components/usage/usage-popover";
+import { ComposerWorktreeToggle } from "@/components/chat/standalone/composer-worktree-toggle";
 import type {
+  ComposerCodingWorkspaceProps,
   ComposerFiltersProps,
   ComposerModelControlsProps,
 } from "./composer-types";
@@ -26,7 +29,9 @@ interface ComposerControlsRowProps {
   canChat: boolean;
   filters: ComposerFiltersProps;
   modelControls: ComposerModelControlsProps;
+  codingWorkspace: ComposerCodingWorkspaceProps;
   isStreaming: boolean;
+  dictation?: React.ComponentProps<typeof ComposerDictationControl>;
   sendButton: {
     isStopMode: boolean;
     hasPendingDocs: boolean;
@@ -39,7 +44,9 @@ export function ComposerControlsRow({
   canChat,
   filters,
   modelControls,
+  codingWorkspace,
   isStreaming,
+  dictation,
   sendButton,
 }: ComposerControlsRowProps) {
   const aiPresets = modelControls.settings.aiPresets;
@@ -131,6 +138,7 @@ export function ComposerControlsRow({
           onPersistDefault={modelControls.onAcpConfigDefault}
         />
       )}
+      <ComposerWorktreeToggle codingWorkspace={codingWorkspace} />
       <ActiveFilterLabels filters={filters} />
       <AIPresetsSelector
         compact
@@ -187,6 +195,7 @@ export function ComposerControlsRow({
         activePreset={modelControls.activePreset}
         sessionId={modelControls.currentQueueSessionId}
       />
+      {dictation && <ComposerDictationControl {...dictation} />}
       <Button
         type={sendButton.isStopMode ? "button" : "submit"}
         size="icon"
