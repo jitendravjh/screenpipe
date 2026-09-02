@@ -199,6 +199,19 @@
       ]
     },
     {
+      "id": "webview-renderer-recovery",
+      "label": "macOS frozen WebKit renderer recovery",
+      "platforms": [
+        "macos"
+      ],
+      "layers": [
+        "window-lifecycle",
+        "tauri-command",
+        "real-ui-e2e",
+        "local-api"
+      ]
+    },
+    {
       "id": "meeting-notes",
       "label": "Meeting note creation and editing",
       "platforms": [
@@ -266,6 +279,19 @@
       ],
       "layers": [
         "os-integration"
+      ]
+    },
+    {
+      "id": "tray-recording-toggle",
+      "label": "Native tray recording pause and resume",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "layers": [
+        "os-integration",
+        "capture-ocr"
       ]
     },
     {
@@ -1527,6 +1553,8 @@
       "features": [
         "chat",
         "chat-answer-rendering",
+        "chat-commentary",
+        "chat-long-tool-liveness",
         "chat-tools",
         "mcp-startup-filtering",
         "pi-tool-activity",
@@ -1535,7 +1563,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "mixed",
-      "notes": "Mixed Python, JavaScript, Screenpipe API, file, test, recovered-error, and optional live Pi tool flows stay collapsed by default, expose only friendly activity on first expansion, and keep completed tools active while the shared Pi turn is still streaming. A completed turn preserves its last assistant answer when a tool event follows it while earlier narration stays hidden. Synthetic MCP startup events stay out of the transcript so the answer remains primary, connection diagnostics never leak into chat, and startup failures never inflate the command rail's failure count."
+      "notes": "Mixed Python, JavaScript, Screenpipe API, file, test, recovered-error, and optional live Pi tool flows stay collapsed by default, expose only friendly activity on first expansion, and keep completed tools active while the shared Pi turn is still streaming. Commentary remains visible in transcript order around live and completed tool groups; settled final answers remain distinct from progress, so unrecovered failure, user-stop, and app-interruption states stay truthful. Synthetic MCP startup events stay out of the transcript so the answer remains primary, connection diagnostics never leak into chat, and startup failures never inflate the command rail's failure count."
     },
     {
       "spec": "chat-window.spec.ts",
@@ -1804,6 +1832,7 @@
       "features": [
         "app-launch",
         "home-navigation",
+        "sidebar-collapse",
         "timeline",
         "settings-recording",
         "pipes"
@@ -1811,7 +1840,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Clicks through Home, Pipes, Timeline, Help, and Settings."
+      "notes": "Clicks through Home, Pipes, Timeline, Help, and Settings; verifies collapsed sidebar chrome hides recording status and restores it on expand."
     },
     {
       "spec": "html-artifact-render.spec.ts",
@@ -2072,7 +2101,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Seeds four stored frames, wraps their exact timestamps in an ended meeting, reopens it from the previous-meetings list, and verifies deduped silent playback, pause stability, and a review screenshot."
+      "notes": "Seeds four stored frames, wraps their exact timestamps in an ended meeting, reopens it from the previous-meetings list, and verifies deduped silent playback, pause stability, unobscured frame layout, and a review screenshot."
     },
     {
       "spec": "meeting-restart-live-transcription.spec.ts",
@@ -2209,7 +2238,7 @@
       "criticality": "high",
       "confidence": "strong",
       "ux": "real-user-flow",
-      "notes": "Isolated agent-home CI lane verifies private native config writes, the resolved local API credential, a real authenticated MCP tool call, skills setup, and removal of the connection slide."
+      "notes": "Isolated agent-home CI lane verifies private native config writes, the resolved local API credential, a real authenticated MCP tool call, skills setup, and migration from the removed connection slide through engine startup to optional recommended setup and completion."
     },
     {
       "spec": "onboarding-first-run.spec.ts",
@@ -2549,6 +2578,29 @@
       "notes": "Privacy content filters surface installed-but-not-captured apps as typeable options with the not-captured hint (fetch-intercepted /installed-apps for determinism)."
     },
     {
+      "spec": "renderer-recovery.spec.ts",
+      "platforms": [
+        "macos"
+      ],
+      "layers": [
+        "window-lifecycle",
+        "tauri-command",
+        "real-ui-e2e",
+        "local-api"
+      ],
+      "features": [
+        "app-launch",
+        "window-lifecycle",
+        "webview-renderer-recovery",
+        "local-api-auth"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "mixed",
+      "tests": 3,
+      "notes": "Suspends the isolated app's real com.apple.WebKit.GPU process, verifies WebContent's main thread and render queue are blocked in remote WebKit GPU IPC, holds the fault until the production watchdog destroys stale Home, then proves a new page generation repaints in the same app PID with uninterrupted local API health. Also forces three consecutive missed-heartbeat recoveries and reopens discarded Search and Chat webviews."
+    },
+    {
       "spec": "recording-health-focus-cold.spec.ts",
       "platforms": [
         "macos"
@@ -2771,6 +2823,24 @@
       "confidence": "strong",
       "ux": "command",
       "notes": "Drives Starting to Recording and reads back the status item from the successfully installed native tray menu."
+    },
+    {
+      "spec": "tray-recording-toggle.spec.ts",
+      "platforms": [
+        "macos"
+      ],
+      "layers": [
+        "os-integration",
+        "tauri-command",
+        "capture-ocr"
+      ],
+      "features": [
+        "tray-recording-toggle"
+      ],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "command",
+      "notes": "Runs the tray's shared native action and proves a real CaptureSession pauses and resumes without the frontend shortcut-event path."
     },
     {
       "spec": "tray-search.spec.ts",

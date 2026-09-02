@@ -14,10 +14,11 @@ use crate::meeting_watcher::shared::ignore::{
 };
 use crate::meeting_watcher::shared::profiles::{load_detection_profiles, MeetingDetectionProfile};
 use crate::meeting_watcher::shared::telemetry::{
-    capture_detection_decision, capture_detection_outcome,
+    capture_detection_decision, capture_detection_outcome, capture_detection_transition,
+    MeetingDetectionTransitionTelemetry,
 };
 use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
 use screenpipe_audio::meeting_detector::MeetingDetector;
 use screenpipe_audio::meeting_processes::{self, AudioInputProcess};
@@ -253,6 +254,7 @@ pub async fn run_audio_process_meeting_detection_loop(
             }
         };
         let now = Instant::now();
+        let now_utc = Utc::now();
 
         let (candidates, live_candidates) = build_candidates(
             &db,
@@ -279,6 +281,28 @@ pub async fn run_audio_process_meeting_detection_loop(
         if is_active_ending_flap(was_active, was_ending, &new_state) {
             flap_count = flap_count.saturating_add(1);
         }
+        let transition = active_ending_transition(was_active, was_ending, &new_state).map(|edge| {
+            let published_meeting_before = detector.as_ref().and_then(|d| d.active_meeting());
+            let published_pid_before = published_meeting_before
+                .as_ref()
+                .and_then(|meeting| meeting.pid);
+            let live_pid =
+                resolved_platform_identity(&live_candidates, &edge.platform).map(|(pid, _)| pid);
+            let published_pid_in_input_snapshot = published_pid_before
+                .is_some_and(|pid| processes.iter().any(|process| process.pid == Some(pid)));
+            let live_pid_in_input_snapshot = live_pid
+                .is_some_and(|pid| processes.iter().any(|process| process.pid == Some(pid)));
+            (
+                edge,
+                published_meeting_before.is_some(),
+                published_pid_before,
+                live_pid,
+                published_pid_in_input_snapshot,
+                live_pid_in_input_snapshot,
+                !candidates.is_empty(),
+                !live_candidates.is_empty(),
+            )
+        });
         state = new_state;
 
         // A browser holding the mic that we can't attribute to a platform is
@@ -322,6 +346,7 @@ pub async fn run_audio_process_meeting_detection_loop(
                 last_explicit_stop_id,
                 &calendar_events,
                 now,
+                now_utc,
             )
             .await;
         }
@@ -371,6 +396,59 @@ pub async fn run_audio_process_meeting_detection_loop(
             &in_meeting_flag,
             &detector,
         );
+        if let Some((
+            edge,
+            published_meeting_before,
+            published_pid_before,
+            live_pid,
+            published_pid_in_input_snapshot,
+            live_pid_in_input_snapshot,
+            has_candidates,
+            has_live_candidates,
+        )) = transition
+        {
+            let published_meeting_after = detector.as_ref().and_then(|d| d.active_meeting());
+            let published_pid_after = published_meeting_after
+                .as_ref()
+                .and_then(|meeting| meeting.pid);
+            info!(
+                "audio-process meeting detector: transition {} (meeting_id={}, app={}, \
+                 published_meeting_before={}, published_meeting_after={}, \
+                 published_pid_before={:?}, published_pid_after={:?}, live_pid={:?}, \
+                 published_pid_in_input_snapshot={}, live_pid_in_input_snapshot={}, \
+                 candidates={}, live_candidates={}, flap_count={})",
+                edge.transition,
+                edge.meeting_id,
+                edge.platform,
+                published_meeting_before,
+                published_meeting_after.is_some(),
+                published_pid_before,
+                published_pid_after,
+                live_pid,
+                published_pid_in_input_snapshot,
+                live_pid_in_input_snapshot,
+                candidates.len(),
+                live_candidates.len(),
+                flap_count,
+            );
+            capture_detection_transition(
+                &edge.platform,
+                MeetingDetectionTransitionTelemetry {
+                    meeting_id: edge.meeting_id,
+                    transition: edge.transition,
+                    flap_count,
+                    published_meeting_before,
+                    published_meeting_after: published_meeting_after.is_some(),
+                    published_pid_before: published_pid_before.is_some(),
+                    published_pid_after: published_pid_after.is_some(),
+                    live_pid: live_pid.is_some(),
+                    published_pid_in_input_snapshot,
+                    live_pid_in_input_snapshot,
+                    has_candidates,
+                    has_live_candidates,
+                },
+            );
+        }
         interval = if processes.is_empty() {
             IDLE_POLL_INTERVAL
         } else {

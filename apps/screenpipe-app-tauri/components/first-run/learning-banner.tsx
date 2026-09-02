@@ -7,8 +7,9 @@
 import React from "react";
 import { emit } from "@tauri-apps/api/event";
 import posthog from "posthog-js";
-import { Clock, ListChecks, Loader2 } from "lucide-react";
+import { Clock, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { commands } from "@/lib/utils/tauri";
 import {
   formatCountdown,
   type FirstRunCapturedApp,
@@ -16,10 +17,6 @@ import {
 import { appIconUrl } from "@/lib/first-run/recent-activity";
 import { AgentHandoffPicker } from "@/components/first-run/agent-handoff-picker";
 import { useFirstRunLearningWindow } from "@/components/first-run/learning-window-provider";
-import {
-  dismissFirstRunSearchShortcutFromParent,
-  FirstRunSearchShortcutPractice,
-} from "@/components/first-run/search-shortcut-practice";
 import type { AgentHandoffTarget } from "@/lib/first-run/agent-handoff";
 
 function CapturedAppIcon({ app }: { app: FirstRunCapturedApp }) {
@@ -157,37 +154,6 @@ export function FirstRunSetupReadyPanel({
   );
 }
 
-export function FirstRunSetupDock({ onDismiss }: { onDismiss: () => void }) {
-  return (
-    <div data-testid="first-run-setup-dock">
-      <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center">
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center border border-signal text-signal">
-          <ListChecks className="h-4 w-4" aria-hidden="true" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="font-mono text-[9px] uppercase tracking-[0.2em] text-signal">
-            getting started
-          </p>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
-            your summary is open. try the search shortcut above, or keep
-            chatting.
-          </p>
-        </div>
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="h-7 shrink-0 px-2 text-[9px]"
-          data-testid="first-run-hide-setup"
-          onClick={onDismiss}
-        >
-          hide tips
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 /**
  * First-run learning window.
  *
@@ -204,12 +170,15 @@ export function FirstRunLearningBanner(
     capturedApps,
     remainingMs,
     chatId,
-    summaryOpenedAt,
     showProgress,
-    markSummaryOpened,
+    markReadyShown,
     dismiss,
   } = learning;
   const { targets: handoffTargets, hint: handoffHint, askAgent } = handoff;
+
+  React.useEffect(() => {
+    if (phase === "ready") markReadyShown();
+  }, [markReadyShown, phase]);
 
   // Only show progress when setup just caused it. A foreground empty result is
   // still a terminal onboarding state: hiding it also hid the daily-summary
@@ -227,41 +196,14 @@ export function FirstRunLearningBanner(
 
   const openSummary = async () => {
     if (!chatId) return;
-    // Distinct from dismiss(). Opening the result keeps optional setup alive,
-    // while hiding the dock explicitly retires it.
     posthog.capture("first_run_summary_opened");
     try {
       await emit("chat-load-conversation", { conversationId: chatId });
-      markSummaryOpened();
+      dismiss();
     } catch {
-      // Keep the full result card so the user can retry instead of collapsing
-      // setup around a summary that did not open.
+      // Keep the result card so the user can retry if the summary did not open.
     }
   };
-
-  // Once the result opens, keep setup as a compact workspace-level control
-  // instead of destroying it or leaving the large onboarding card above every
-  // chat. A blank chat can still render its normal starter beneath the dock.
-  if (phase === "ready" && summaryOpenedAt) {
-    return (
-      <>
-        <section
-          data-testid="first-run-learning-banner"
-          data-phase="ready"
-          className="mx-auto mb-4 w-full max-w-3xl overflow-hidden border border-border bg-background"
-        >
-          <FirstRunSearchShortcutPractice />
-          <FirstRunSetupDock
-            onDismiss={() => {
-              dismissFirstRunSearchShortcutFromParent();
-              dismiss();
-            }}
-          />
-        </section>
-        {fallback ? <>{fallback}</> : null}
-      </>
-    );
-  }
 
   return (
     <section
@@ -352,5 +294,124 @@ export function FirstRunLearningBanner(
         <FirstRunSetupReadyPanel onDismiss={() => dismiss()} />
       )}
     </section>
+  );
+}
+
+export function TrialActivationSummaryExperience() {
+  const { learning } = useFirstRunLearningWindow();
+  const { phase, remainingMs, chatId, markSummaryOpened } = learning;
+
+  const openSummary = async () => {
+    if (!chatId || phase !== "ready") return;
+    posthog.capture("first_run_summary_opened", {
+      experiment: "first-summary-card-trial-v1",
+      variant: "summary_first",
+      source: "home_cta",
+    });
+    try {
+      // This CTA replaces the locked summary screen with StandaloneChat, so
+      // there is no chat-load-conversation listener until after this state
+      // change mounts Chat. Persist the handoff before mounting it; the chat
+      // routing hook consumes this key on mount.
+      localStorage.setItem("pending-chat-conversation", chatId);
+      markSummaryOpened();
+      await emit("chat-load-conversation", {
+        conversationId: chatId,
+        targetWindow: "home",
+      });
+    } catch {
+      // Keep the ready action available until the chat really opens.
+    }
+  };
+
+  const retry = async () => {
+    posthog.capture("first_run_summary_retry_clicked", {
+      experiment: "first-summary-card-trial-v1",
+      variant: "summary_first",
+    });
+    await commands.completeOnboarding();
+  };
+
+  return (
+    <main
+      className="flex h-full w-full items-center justify-center bg-background px-8"
+      data-testid="trial-activation-summary-experience"
+      data-phase={phase}
+    >
+      <section className="w-full max-w-2xl border border-border bg-background p-10 text-center">
+        <div className="mx-auto flex h-20 w-20 items-center justify-center border border-border">
+          {phase === "learning" ? (
+            <span
+              className="font-mono text-2xl tabular-nums"
+              data-testid="trial-activation-countdown"
+            >
+              {formatCountdown(remainingMs)}
+            </span>
+          ) : (
+            <Loader2 className="h-7 w-7 animate-spin text-muted-foreground" />
+          )}
+        </div>
+        <h1 className="mt-7 text-2xl font-semibold lowercase">
+          {phase === "ready"
+            ? "your first summary is ready"
+            : phase === "empty"
+              ? "we need another try"
+              : phase === "writing"
+                ? "writing your first summary"
+                : "building your first summary"}
+        </h1>
+        <p className="mx-auto mt-3 max-w-lg text-sm leading-relaxed text-muted-foreground">
+          {phase === "empty"
+            ? "Screenpipe did not capture enough valid activity to show you a useful result. Keep working normally, then retry."
+            : phase === "ready"
+              ? "Open the result to see what Screenpipe understood from your work."
+              : "Keep working normally while Screenpipe records only what it needs to build this result."}
+        </p>
+        {phase === "empty" ? (
+          <Button className="mt-8 h-12 px-8 text-sm" onClick={() => void retry()}>
+            retry summary
+          </Button>
+        ) : (
+          <Button
+            className="mt-8 h-12 min-w-56 px-8 text-sm"
+            disabled={phase !== "ready" || !chatId}
+            onClick={() => void openSummary()}
+            data-testid="trial-activation-view-summary"
+          >
+            view summary
+          </Button>
+        )}
+      </section>
+    </main>
+  );
+}
+
+export function TrialActivationUnlockPrompt({
+  onStartTrial,
+  inline = false,
+}: {
+  onStartTrial: () => void;
+  inline?: boolean;
+}) {
+  return (
+    <div
+      className={
+        inline
+          ? "z-40 flex shrink-0 justify-center border-t border-border bg-background p-4"
+          : "pointer-events-none absolute inset-0 z-40 flex items-end justify-center p-8"
+      }
+      data-testid="trial-activation-summary-lock"
+      data-layout={inline ? "inline" : "overlay"}
+    >
+      <div className="pointer-events-auto w-full max-w-xl border border-border bg-background p-5 text-center shadow-lg">
+        <Button
+          className="h-12 w-full px-8 text-sm"
+          data-testid="trial-activation-start-trial"
+          onClick={onStartTrial}
+        >
+          start your 7-day free trial to unlock full access
+        </Button>
+      </div>
+    </div>
   );
 }

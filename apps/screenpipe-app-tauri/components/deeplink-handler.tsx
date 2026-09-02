@@ -32,7 +32,7 @@ import {
 } from "@/lib/first-run/agent-handoff";
 import {
   LEARNING_SUMMARY_OPENED_EVENT,
-  markLearningSummaryOpened,
+  markLearningDone,
   readLearningWindow,
 } from "@/lib/first-run/learning-window";
 import { trackFirstRunSummaryNotificationOpened } from "@/lib/first-run/telemetry";
@@ -112,13 +112,17 @@ export function DeeplinkHandler() {
           }
         }
         if (!chatId) return;
+        // The trial-activation screen does not mount Chat until the summary is
+        // opened. Preserve the requested conversation across that remount so
+        // a notification can never land on the generic Chat starter.
+        localStorage.setItem("pending-chat-conversation", chatId);
         await commands.showWindowActivated({ Home: { page: "home" } });
         await new Promise((resolve) => setTimeout(resolve, 150));
         await emit("chat-load-conversation", {
           conversationId: chatId,
           targetWindow: "home",
         });
-        markLearningSummaryOpened();
+        markLearningDone();
         await emit(LEARNING_SUMMARY_OPENED_EVENT);
         posthog.capture("first_run_summary_opened", {
           source: "notification",
@@ -168,6 +172,17 @@ export function DeeplinkHandler() {
             clipboard_copied: result.copied,
             source: "notification",
           });
+        }
+        return;
+      }
+
+      if (
+        parsedUrl.host === "database-restart-verification" ||
+        parsedUrl.pathname === "database-restart-verification"
+      ) {
+        const result = await commands.restartDatabaseVerification();
+        if (result.status === "error") {
+          throw new Error(result.error);
         }
         return;
       }
@@ -580,7 +595,16 @@ export function DeeplinkHandler() {
       }),
 
       listen("shortcut-start-recording", async () => {
-        await commands.startCapture();
+        const result = await commands.startCapture();
+
+        if (result.status === "error") {
+          toast({
+            title: "recording could not start",
+            description: result.error,
+            variant: "destructive",
+          });
+          return;
+        }
 
         toast({
           title: "recording started",
@@ -594,6 +618,19 @@ export function DeeplinkHandler() {
         toast({
           title: "recording paused",
           description: "capture paused — scheduled tasks and search still available",
+        });
+      }),
+
+      // The native tray owns the capture action. This event only mirrors the
+      // completed state into any mounted UI; it must never be required for the
+      // tray click itself to work.
+      listen<string>("tray-recording-state-changed", (event) => {
+        const started = event.payload === "started";
+        toast({
+          title: started ? "recording started" : "recording paused",
+          description: started
+            ? "screen recording has been initiated"
+            : "capture paused — scheduled tasks and search still available",
         });
       }),
 

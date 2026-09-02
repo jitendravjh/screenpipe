@@ -12,7 +12,7 @@ use crate::capture_session::CaptureSession;
 use crate::config;
 use crate::permissions::{do_permissions_check, OSPermissionStatus};
 use crate::server_core::ServerCore;
-use crate::store::{LocalPlanPolicy, SettingsStore};
+use crate::store::{LocalPlanPolicy, OnboardingStore, SettingsStore};
 use screenpipe_engine::RecordingConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -127,6 +127,33 @@ fn recording_access_policy(
     has_verified_local_plan: bool,
     enterprise_authorized: bool,
     consumer_requires_enterprise_app: bool,
+    trial_activation_paywall: bool,
+    authentication_status: crate::startup_auth::AuthenticationStatus,
+) -> bool {
+    if authentication_status == crate::startup_auth::AuthenticationStatus::LoggedOut {
+        return false;
+    }
+    if trial_activation_paywall {
+        return false;
+    }
+    if authentication_status == crate::startup_auth::AuthenticationStatus::NotRequired {
+        return true;
+    }
+    server_access_policy(
+        is_enterprise_build,
+        dev_bypass,
+        has_verified_local_plan,
+        enterprise_authorized,
+        consumer_requires_enterprise_app,
+    )
+}
+
+fn server_access_policy(
+    is_enterprise_build: bool,
+    dev_bypass: bool,
+    has_verified_local_plan: bool,
+    enterprise_authorized: bool,
+    consumer_requires_enterprise_app: bool,
 ) -> bool {
     if dev_bypass {
         return true;
@@ -143,11 +170,8 @@ fn recording_access_policy(
     has_verified_local_plan
 }
 
-/// Consumer builds allow signed-in accounts to record on the free plan.
-/// Enterprise builds keep their native entitlement guard, and consumer builds
-/// still reject accounts that are required to use an enterprise binary.
-pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
-    recording_access_policy(
+pub(crate) fn server_access_allowed(store: &SettingsStore) -> bool {
+    server_access_policy(
         cfg!(feature = "enterprise-build"),
         cfg!(debug_assertions),
         store.local_plan_policy() != LocalPlanPolicy::Unknown,
@@ -156,13 +180,63 @@ pub(crate) fn recording_access_allowed(store: &SettingsStore) -> bool {
     )
 }
 
-fn require_recording_access(store: &SettingsStore) -> Result<(), String> {
-    if recording_access_allowed(store) {
+/// Consumer builds allow signed-in accounts to record on the free plan.
+/// Enterprise builds keep their native entitlement guard, and consumer builds
+/// still reject accounts that are required to use an enterprise binary.
+pub(crate) fn recording_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
+    let trial_activation_paywall = !crate::should_skip_onboarding()
+        && OnboardingStore::get(app)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .blocks_trial_activation_recording();
+    let resolved_authentication = app
+        .try_state::<crate::startup_auth::AuthenticationStatus>()
+        .map(|status| *status)
+        .unwrap_or(crate::startup_auth::AuthenticationStatus::LoggedOut);
+    // The bootstrap result owns initial startup ordering. A later successful
+    // sign-in may open recording without relaunching the already-initialized
+    // app, so derive the current authenticated state from the same native
+    // authorities used by the runtime guards.
+    let authentication_status = if resolved_authentication
+        == crate::startup_auth::AuthenticationStatus::LoggedOut
+        && if cfg!(feature = "enterprise-build") {
+            crate::enterprise_policy::recording_authorized()
+        } else {
+            store.has_cloud_authentication()
+        }
+    {
+        crate::startup_auth::AuthenticationStatus::Authenticated
+    } else {
+        resolved_authentication
+    };
+    recording_access_policy(
+        cfg!(feature = "enterprise-build"),
+        cfg!(debug_assertions),
+        store.local_plan_policy() != LocalPlanPolicy::Unknown,
+        crate::enterprise_policy::recording_authorized(),
+        !cfg!(debug_assertions) && store.requires_enterprise_app_for_consumer(),
+        trial_activation_paywall,
+        authentication_status,
+    )
+}
+
+fn require_recording_access(app: &tauri::AppHandle, store: &SettingsStore) -> Result<(), String> {
+    if recording_access_allowed(app, store) {
         return Ok(());
     }
 
     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
     Err("account_required: sign in to start screenpipe recording".to_string())
+}
+
+fn require_server_access(store: &SettingsStore) -> Result<(), String> {
+    if server_access_allowed(store) {
+        return Ok(());
+    }
+
+    crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
+    Err("account_required: sign in to start screenpipe".to_string())
 }
 
 pub fn notify_audio_engine_fallback(store: &SettingsStore) {
@@ -240,14 +314,9 @@ pub struct RecordingState {
     pub capture: Arc<Mutex<Option<CaptureSession>>>,
     /// True while a server start is in progress (prevents race between main.rs boot and frontend)
     pub is_starting: Arc<AtomicBool>,
-    /// True while a `start_capture` invocation is in flight. The frontend
-    /// mounts `<DeeplinkHandler />` in every webview window, and the tray
-    /// emits `shortcut-start-recording` app-wide — every listening window
-    /// fires `commands.startCapture()` simultaneously. Without this guard,
-    /// concurrent calls both pass the is_some() check, both build a
-    /// CaptureSession, and the second clobbers the first — dropping the
-    /// first runs its shutdown handlers and tears down workers shared with
-    /// the second, surfacing as a PoolClosed cascade and lost audio chunks.
+    /// True while the caller holding `capture` is building a capture session.
+    /// Duplicate app-wide start requests wait on that mutex, then observe the
+    /// installed session instead of starting another one.
     pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
@@ -635,21 +704,33 @@ async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
         if let Some(key) = api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        match req.send().await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => {
-                warn!(
-                    "health probe {} failed (timeout {}s), {}",
-                    health_url,
-                    timeout_secs,
-                    if timeout_secs == 2 {
-                        "retrying once before declaring the server dead"
-                    } else {
-                        "server considered dead"
-                    }
-                );
+        let healthy = match req.send().await {
+            Ok(r) => {
+                let status = r.status().as_u16();
+                r.json::<serde_json::Value>()
+                    .await
+                    .map(|payload| {
+                        screenpipe_engine::health_identity::is_screenpipe_health_response(
+                            status, &payload,
+                        )
+                    })
+                    .unwrap_or(false)
             }
+            Err(_) => false,
+        };
+        if healthy {
+            return true;
         }
+        warn!(
+            "health probe {} failed identity check (timeout {}s), {}",
+            health_url,
+            timeout_secs,
+            if timeout_secs == 2 {
+                "retrying once before declaring the server dead"
+            } else {
+                "server considered dead"
+            }
+        );
     }
     false
 }
@@ -663,27 +744,28 @@ pub async fn start_capture(
 ) -> Result<(), String> {
     info!("Starting capture session");
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    require_recording_access(&store)?;
+    require_recording_access(&app, &store)?;
 
     // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
     // — record it so the health watchdog will respawn a crashed engine instead
     // of treating the absence of capture as a deliberate stop.
     state.set_capture_intent(true);
 
-    // Race guard: short-circuit duplicate invocations.
+    // Serialize duplicate invocations on the capture slot.
     //
     // `<DeeplinkHandler />` is mounted in every non-overlay webview, and the
-    // tray emits `shortcut-start-recording` app-wide — every listening window
-    // fires `commands.startCapture()` simultaneously. Without this guard, two
-    // concurrent calls both pass the `is_some()` check, both build a
-    // CaptureSession (~290ms), and the second clobbers the first. Dropping
-    // the first runs its shutdown handlers, which tear down workers shared
-    // with the second — surfacing as a PoolClosed cascade and silently lost
-    // audio chunks.
-    if state.is_starting_capture.swap(true, Ordering::SeqCst) {
-        info!("Capture start already in progress, skipping duplicate");
+    // global shortcut emits `shortcut-start-recording` app-wide — every listening window
+    // fires `commands.startCapture()` simultaneously. Holding this lock through
+    // the session build makes later calls wait for the winning call. On success
+    // they observe the installed session and return success only after capture
+    // is actually running, so their webviews cannot toast success prematurely.
+    let mut capture_guard = state.capture.lock().await;
+    if capture_guard.is_some() {
+        info!("Capture session already running");
         return Ok(());
     }
+
+    state.is_starting_capture.store(true, Ordering::SeqCst);
     struct ResetGuard<'a>(&'a AtomicBool);
     impl Drop for ResetGuard<'_> {
         fn drop(&mut self) {
@@ -691,15 +773,6 @@ pub async fn start_capture(
         }
     }
     let _reset = ResetGuard(&state.is_starting_capture);
-
-    // Hold the capture lock from the is_some check through the assign so a
-    // concurrent `start_capture_internal` (called from spawn_screenpipe's
-    // existing-server path, not gated by is_starting_capture) can't race us.
-    let mut capture_guard = state.capture.lock().await;
-    if capture_guard.is_some() {
-        info!("Capture session already running");
-        return Ok(());
-    }
 
     // `state.server.is_some()` only means ServerCore was constructed once; it
     // does NOT mean the HTTP serve task is still alive. Long-running sessions
@@ -709,7 +782,9 @@ pub async fn start_capture(
     let (port, api_key) = {
         let server_guard = state.server.lock().await;
         let Some(ref core) = *server_guard else {
-            return Err("Server not running — cannot start capture".to_string());
+            warn!("Server not running — requesting full restart");
+            let _ = app.emit("request-server-restart", ());
+            return Err("Server not running — full restart requested".to_string());
         };
         (core.port, core.local_api_key.clone())
     };
@@ -860,10 +935,16 @@ pub async fn spawn_screenpipe(
     app: tauri::AppHandle,
     _override_args: Option<Vec<String>>,
 ) -> Result<(), String> {
-    // Mark recording as intended-ON up front (even if the start below fails or
-    // is deferred by cooldown) so the health watchdog will keep trying to bring
-    // a crashed/failed server back instead of treating it as a user stop.
-    state.set_capture_intent(true);
+    // A summary-paywall install still needs the long-lived local read server
+    // for Timeline, but it must not publish capture intent or restart capture.
+    let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
+    require_server_access(&store)?;
+    let capture_allowed = recording_access_allowed(&app, &store);
+
+    // Normal starts publish capture intent before touching lifecycle state.
+    // The paywall deliberately leaves it OFF, so the same server startup path
+    // cannot accidentally create a CaptureSession.
+    state.set_capture_intent(capture_allowed);
 
     // Do not wait for the lifecycle lock. It is held across a full stop/start,
     // so when the app is already bringing the server up — the ordinary case
@@ -942,7 +1023,7 @@ async fn spawn_screenpipe_inner(
     }
 
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    if let Err(err) = require_recording_access(&store) {
+    if let Err(err) = require_server_access(&store) {
         state.is_starting.store(false, Ordering::SeqCst);
         state.is_starting_capture.store(false, Ordering::SeqCst);
         return Err(err);
@@ -1232,12 +1313,17 @@ async fn spawn_screenpipe_inner(
         );
     }
 
-    // Resolve the API auth key exactly once per process via the shared
-    // helper and seed the cache before `to_recording_config` reads it. The
-    // helper handles env var / settings / secret-store / auth.json lookup
+    // Build the effective config before deciding whether auth needs a key.
+    // `from_settings` force-enables auth when LAN access is enabled, even if
+    // the persisted `apiAuth` field is false. Checking the persisted field
+    // here used to start an auth-enforcing server without any accepted key.
+    let mut recording_config = store.to_recording_config(data_dir.clone());
+
+    // Resolve the API auth key exactly once per process via the shared helper.
+    // The helper handles env var / settings / secret-store / auth.json lookup
     // and persists auto-generated keys to the secret store itself, so every
     // reader (server, MCP, auth CLI) sees the same value.
-    if store.recording.api_auth {
+    if recording_config.api_auth {
         let settings_key_opt = if store.recording.api_key.is_empty() {
             None
         } else {
@@ -1249,13 +1335,15 @@ async fn spawn_screenpipe_inner(
         )
         .await
         {
-            Ok(key) => crate::store::seed_api_auth_key(key),
+            Ok(key) => {
+                crate::store::seed_api_auth_key(key.clone());
+                recording_config.api_auth_key = Some(key);
+            }
             Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
         }
     }
 
     notify_audio_engine_fallback(&store);
-    let recording_config = store.to_recording_config(data_dir);
 
     let server_arc = state.server.clone();
     let capture_arc = state.capture.clone();
@@ -1474,7 +1562,7 @@ async fn start_capture_internal(
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     let store = SettingsStore::get(app).ok().flatten().unwrap_or_default();
-    require_recording_access(&store)?;
+    require_recording_access(app, &store)?;
 
     let mut capture_guard = state.capture.lock().await;
     if capture_guard.is_some() {
@@ -1561,41 +1649,145 @@ mod capture_intent_tests {
 }
 
 #[cfg(test)]
+mod local_api_auth_tests {
+    use super::SettingsStore;
+    use serde_json::json;
+
+    #[test]
+    fn managed_lan_access_requires_a_key_when_persisted_api_auth_is_false() {
+        // This is the exact flattened store shape produced when enterprise
+        // policy enables LAN access on a device that previously disabled API
+        // auth. Startup must follow the effective config, not `apiAuth` alone.
+        let store: SettingsStore = serde_json::from_value(json!({
+            "apiAuth": false,
+            "listenOnLan": true
+        }))
+        .expect("managed settings shape should deserialize");
+
+        let config = store.to_recording_config(std::path::PathBuf::from("test-data"));
+
+        assert!(config.api_auth);
+    }
+}
+
+#[cfg(test)]
 mod recording_access_tests {
-    use super::recording_access_policy;
+    use super::{recording_access_policy, server_access_policy};
+    use crate::startup_auth::AuthenticationStatus;
 
     #[test]
     fn verified_free_consumer_can_record_without_a_paid_entitlement() {
         assert!(recording_access_policy(
-            false, false, true, false, false
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
         ));
     }
 
     #[test]
     fn consumer_with_unknown_plan_cannot_record() {
         assert!(!recording_access_policy(
-            false, false, false, false, false
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
         ));
     }
 
     #[test]
     fn signed_out_consumer_cannot_start_recording() {
         assert!(!recording_access_policy(
-            false, false, false, false, false
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::LoggedOut,
         ));
     }
 
     #[test]
     fn enterprise_build_requires_verified_enterprise_session() {
-        assert!(!recording_access_policy(true, false, true, false, false));
-        assert!(recording_access_policy(true, false, false, true, false));
+        assert!(!recording_access_policy(
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
+        assert!(recording_access_policy(
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            AuthenticationStatus::Authenticated,
+        ));
     }
 
     #[test]
     fn mandatory_enterprise_org_cannot_record_from_consumer_binary() {
         assert!(!recording_access_policy(
-            false, false, true, true, true
+            false,
+            false,
+            true,
+            true,
+            true,
+            false,
+            AuthenticationStatus::Authenticated,
         ));
+    }
+
+    #[test]
+    fn summary_paywall_blocks_capture_even_in_debug_builds() {
+        assert!(!recording_access_policy(
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            AuthenticationStatus::Authenticated,
+        ));
+    }
+
+    #[test]
+    fn signup_free_startup_does_not_require_account_or_enterprise_auth() {
+        assert!(recording_access_policy(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            AuthenticationStatus::NotRequired,
+        ));
+        assert!(recording_access_policy(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            AuthenticationStatus::NotRequired,
+        ));
+    }
+
+    #[test]
+    fn summary_paywall_keeps_the_local_read_server_available() {
+        assert!(server_access_policy(false, true, true, false, false));
+        assert!(server_access_policy(false, false, true, false, false));
     }
 }
 

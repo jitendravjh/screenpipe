@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogClose, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Download, ExternalLink, Check, Loader2, Copy, Terminal, LogIn, LogOut, RotateCw, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen, Plus, AlertCircle, MessageSquare, Inbox, ChevronDown, Bird } from "lucide-react";
+import { Download, ExternalLink, Check, Loader2, Copy, Terminal, LogIn, LogOut, RotateCw, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff, FolderOpen, Plus, AlertCircle, MessageSquare, Inbox, ChevronDown } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { commands } from "@/lib/utils/tauri";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -263,7 +263,6 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
       addIf("notion", macAppExists("Notion")),
       addIf("linear", macAppExists("Linear")),
       addIf("perplexity", macAppExists("Perplexity")),
-      addIf("littlebird", macAppExists("Littlebird")),
       addIf("krisp", macAppExists("Krisp")),
       addIf("codex", getCodexConfigPath().then(pathExists)),
       addIf("grok", getGrokConfigPath().then(pathExists)),
@@ -330,11 +329,6 @@ async function detectInstalledConnectionIds(): Promise<Set<string>> {
       addIf("perplexity", anyPathExists([
         local("Programs", "Perplexity", "Perplexity.exe"),
         ...windowsApps("Perplexity.exe"),
-      ])),
-      addIf("littlebird", anyPathExists([
-        local("Programs", "Littlebird", "Littlebird.exe"),
-        roaming("Littlebird"),
-        ...windowsApps("Littlebird.exe"),
       ])),
       addIf("krisp", anyPathExists([
         local("Programs", "Krisp", "Krisp.exe"),
@@ -582,7 +576,6 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
     quickbooks: <img src="/images/quickbooks.svg" alt="QuickBooks Online" className="w-5 h-5" />,
     notion: <img src="/images/notion.svg" alt="Notion" className="w-5 h-5 dark:invert" />,
     linear: <img src="/images/linear.svg" alt="Linear" className="w-5 h-5" />,
-    littlebird: <Bird className="h-5 w-5 text-foreground" aria-label="Littlebird" />,
     krisp: <img src="/images/krisp.svg" alt="Krisp" className="w-5 h-5 dark:invert" />,
     plaud: <img src="/images/plaud.png" alt="Plaud" className="w-5 h-5 dark:invert" />,
     excalidraw: <img src="/images/excalidraw.svg" alt="Excalidraw" className="w-5 h-5" />,
@@ -791,7 +784,6 @@ export const TRY_IN_CHAT_PROMPTS: Record<string, string> = {
   gmail: "Summarize my recent emails",
   "google-drive": "Find my recent files in Google Drive",
   "google-sheets": "What's in my latest spreadsheet?",
-  littlebird: "Search my Littlebird memory for recent decisions and meetings",
   krisp: "Search my meeting transcripts for action items",
   excalidraw: "What's on my recent Excalidraw boards?",
   whatsapp: "What were the latest messages in my WhatsApp?",
@@ -817,7 +809,7 @@ function tryInChat(tile: ConnectionTile) {
 }
 
 // Horizontal list row with description — used in the browse section
-function ListRow({ tile, selected, onClick, onTryInChat }: {
+export function ListRow({ tile, selected, onClick, onTryInChat }: {
   tile: ConnectionTile;
   selected: boolean;
   onClick: () => void;
@@ -845,7 +837,12 @@ function ListRow({ tile, selected, onClick, onTryInChat }: {
       <div className="flex flex-1 min-w-0 flex-col gap-1.5">
         <p className="text-sm font-semibold leading-tight text-foreground">{tile.name}</p>
         {tile.description && (
-          <p className="text-xs leading-snug text-muted-foreground truncate">{tile.description}</p>
+          <p
+            className="text-xs leading-snug text-muted-foreground line-clamp-2"
+            title={tile.description}
+          >
+            {tile.description}
+          </p>
         )}
       </div>
       <div className="relative h-7 w-7 shrink-0">
@@ -1638,8 +1635,8 @@ function MemorySyncSubsection({
       <div className="space-y-0.5">
         <p className="text-xs font-medium text-foreground">memory sync (beta)</p>
         <p className="text-xs text-muted-foreground">
-          writes your screenpipe memories into {targetFilename} so {assistantName} sees them
-          in every new session. updates automatically every 5 minutes.
+          writes safe recall instructions into {targetFilename} so {assistantName} can retrieve
+          relevant memories through screenpipe MCP. updates automatically every 5 minutes.
         </p>
       </div>
 
@@ -2270,9 +2267,10 @@ export function getOAuthFallbackMessage(
   return "Zendesk OAuth failed. Use advanced: connect with a token instead.";
 }
 
-function OAuthPanel({
+export function OAuthPanel({
   integrationId,
   integrationName,
+  description,
   supportsOAuthInstances,
   initialScopeVariant,
   onConnected,
@@ -2280,6 +2278,7 @@ function OAuthPanel({
 }: {
   integrationId: string;
   integrationName: string;
+  description?: string;
   supportsOAuthInstances: boolean;
   initialScopeVariant?: string | null;
   onConnected?: () => void;
@@ -2427,7 +2426,7 @@ function OAuthPanel({
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        {panelCopy.description}
+        {description ?? panelCopy.description}
       </p>
       {connected && (
         <div className="space-y-2">
@@ -3246,7 +3245,7 @@ export function ApiIntegrationPanel({ integration, onRefresh }: {
 }
 
 // ---------------------------------------------------------------------------
-// Featured OAuth MCP cards
+// Featured OAuth MCP cards (Krisp, Plaud)
 // ---------------------------------------------------------------------------
 //
 // Some providers expose their data (meeting transcripts, recordings, notes)
@@ -3259,7 +3258,6 @@ export function ApiIntegrationPanel({ integration, onRefresh }: {
 
 const KRISP_MCP_URL = "https://mcp.krisp.ai/mcp";
 const PLAUD_MCP_URL = "https://mcp.plaud.ai/mcp";
-const LITTLEBIRD_MCP_URL = "https://mcp.littlebird.ai/mcp";
 // Providers that run a first-party remote MCP server whose OAuth supports
 // Dynamic Client Registration (RFC 7591). For these, the tile connects in
 // one click via OAuthMcpPanel — no API key and no human-created
@@ -3285,18 +3283,6 @@ export const MCP_OAUTH_PROVIDERS: {
   { id: "confluence", name: "Confluence", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and edit your Confluence pages (and Jira issues). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
   { id: "jira", name: "Jira", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and manage your Jira issues (and Confluence pages). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
   { id: "notion", name: "Notion", url: "https://mcp.notion.com/mcp", description: <>Connect Notion so your AI can search, read, and write your pages and databases. Sign-in uses Notion&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
-  {
-    id: "littlebird",
-    name: "Littlebird",
-    url: LITTLEBIRD_MCP_URL,
-    description: (
-      <>
-        Connect Littlebird so your AI can search your existing Littlebird memory
-        while Screenpipe builds new local history. This links access; it does not
-        copy or delete data. Enable MCP in Littlebird before signing in.
-      </>
-    ),
-  },
 ];
 
 export function isMcpOAuthProviderTileConnected(
@@ -4041,7 +4027,6 @@ export function ConnectionsSection({
       { id: "notion", name: "Notion", icon: "notion", connected: false, detected: detectedConnectionIds.has("notion") },
       { id: "linear", name: "Linear", icon: "linear", connected: false, detected: detectedConnectionIds.has("linear") },
       { id: "perplexity", name: "Perplexity", icon: "perplexity", connected: false, detected: detectedConnectionIds.has("perplexity") },
-      { id: "littlebird", name: "Littlebird", icon: "littlebird", connected: !!mcpProviderConnected.littlebird, detected: detectedConnectionIds.has("littlebird") },
       { id: "krisp", name: "Krisp", icon: "krisp", connected: krispConnected, detected: detectedConnectionIds.has("krisp") },
       { id: "plaud", name: "Plaud", icon: "plaud", connected: plaudConnected },
       { id: "excalidraw", name: "Excalidraw", icon: "excalidraw", connected: excalidrawConnected },
@@ -4362,6 +4347,7 @@ export function ConnectionsSection({
                 <OAuthPanel
                   integrationId={selectedIntegration.id}
                   integrationName={selectedIntegration.name}
+                  description={selectedIntegration.description}
                   supportsOAuthInstances={!!selectedIntegration.supports_oauth_instances}
                   initialScopeVariant={selectedScopeVariant}
                   onConnected={() => refreshIntegrationConnection(selectedIntegration.id, true)}

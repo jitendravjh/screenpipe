@@ -528,6 +528,7 @@ const E2E_COMMANDS: &[&str] = &[
     "low_disk_guard_enabled",
     "set_tray_recording_status",
     "installed_tray_recording_status",
+    "trigger_tray_recording_toggle",
     "shortcut_reminder_visible",
     "open_auto_meeting",
     "simulate_calendar_meeting_match",
@@ -557,6 +558,8 @@ const E2E_COMMANDS: &[&str] = &[
     "capture_pi_start_error",
     "set_onboarding_completed_ago",
     "e2e_set_activation_allowed",
+    "arm_renderer_stalls",
+    "renderer_recovery_state",
 ];
 
 fn validate_e2e_command_inventory() {

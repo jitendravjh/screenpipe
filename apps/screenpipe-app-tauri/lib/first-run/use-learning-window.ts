@@ -19,6 +19,7 @@ import {
   markLearningDone,
   markLearningEmpty,
   markLearningReady,
+  markLearningReadyShown,
   markLearningSummaryOpened,
   markLearningWriting,
   resetLearningWindow,
@@ -27,11 +28,19 @@ import {
   type FirstRunLearningState,
 } from "@/lib/first-run/learning-window";
 import { fetchRecentActivity } from "@/lib/first-run/recent-activity";
+import {
+  TRIAL_ACTIVATION_PAYWALL_STEP,
+  trialActivationState,
+  type TrialActivationState,
+} from "@/lib/first-run/trial-activation";
 
 export type LearningWindowView = FirstRunLearningState & {
   remainingMs: number;
+  activationState: TrialActivationState;
   markSummaryOpened: () => void;
+  markSummaryRendered: () => Promise<void>;
   markNotificationSent: () => void;
+  markReadyShown: () => void;
   dismiss: () => void;
 };
 
@@ -46,13 +55,20 @@ export type LearningWindowOptions = {
 export function useLearningWindow(
   _options: LearningWindowOptions = {},
 ): LearningWindowView {
-  const [state, setState] = useState<FirstRunLearningState>(() =>
-    readLearningWindow(),
-  );
+  const [state, setState] = useState<FirstRunLearningState>(() => {
+    const stored = readLearningWindow();
+    // A ready card is a one-session announcement, not a replacement for the
+    // normal Home starter on every later app launch. The chat remains durable.
+    return stored.phase === "ready" && stored.readyShownAt
+      ? markLearningDone()
+      : stored;
+  });
   const [capturedApps, setCapturedApps] = useState<FirstRunCapturedApp[]>([]);
   const [remainingMs, setRemainingMs] = useState(() =>
     learningWindowRemainingMs(readLearningWindow().startedAt),
   );
+  const [activationState, setActivationState] =
+    useState<TrialActivationState>("inactive");
 
   useEffect(() => {
     let cancelled = false;
@@ -60,6 +76,7 @@ export function useLearningWindow(
       const result = await commands.getOnboardingStatus();
       if (cancelled || result.status !== "ok" || !result.data.isCompleted) return;
       const native = result.data;
+      setActivationState(trialActivationState(native.currentStep));
       const startedAt = native.firstRunSummaryStartedAt ?? native.completedAt;
       const phase = native.firstRunSummaryPhase ?? "idle";
 
@@ -80,9 +97,12 @@ export function useLearningWindow(
       }
       if (phase === "ready" && native.firstRunSummaryChatId) {
         const stored = readLearningWindow();
+        // Local dismissal is final for this first-run result. `done` clears the
+        // chat id, so comparing ids first would revive the card every second.
+        if (stored.phase === "done") return;
         if (
           stored.chatId !== native.firstRunSummaryChatId ||
-          (stored.phase !== "done" && stored.phase !== "ready")
+          stored.phase !== "ready"
         ) {
           setState(markLearningReady(native.firstRunSummaryChatId));
         }
@@ -134,8 +154,21 @@ export function useLearningWindow(
   }, []);
 
   const markSummaryOpened = useCallback(() => setState(markLearningSummaryOpened()), []);
+  const markSummaryRendered = useCallback(async () => {
+    if (activationState !== "summary") return;
+    await commands.setOnboardingStep(TRIAL_ACTIVATION_PAYWALL_STEP);
+    posthog.capture("first_run_summary_rendered", {
+      experiment: "first-summary-card-trial-v1",
+      variant: "summary_first",
+      eligible_new_install: true,
+    });
+    setActivationState("paywall");
+  }, [activationState]);
   // Notification persistence is native; retained for the existing view contract.
   const markNotificationSent = useCallback(() => {}, []);
+  const markReadyShown = useCallback(() => {
+    markLearningReadyShown();
+  }, []);
   const dismiss = useCallback(() => {
     posthog.capture("first_run_learning_dismissed", {
       phase: state.phase,
@@ -148,8 +181,11 @@ export function useLearningWindow(
     ...state,
     capturedApps,
     remainingMs,
+    activationState,
     markSummaryOpened,
+    markSummaryRendered,
     markNotificationSent,
+    markReadyShown,
     dismiss,
   };
 }

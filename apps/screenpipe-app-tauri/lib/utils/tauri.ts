@@ -501,9 +501,9 @@ async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> 
     else return { status: "error", error: e  as any };
 }
 },
-async generateActivityHistory(start: string, end: string) : Promise<Result<PersistedActivityHistory, string>> {
+async generateActivityHistory(start: string, end: string, idempotencyKey: string) : Promise<Result<PersistedActivityHistory, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("generate_activity_history", { start, end }) };
+    return { status: "ok", data: await TAURI_INVOKE("generate_activity_history", { start, end, idempotencyKey }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1285,12 +1285,11 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 },
 /**
  * Open the screenpipe.com login page.
- * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
- * Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
+ * Normal login opens the user's default browser and returns through the
+ * versioned app-specific deep-link callback.
  *
- * `fresh_session` is used by "use different account": macOS asks
- * ASWebAuthenticationSession for an ephemeral browser session instead of
- * reusing Safari cookies, and Windows/Linux use a throwaway webview profile.
+ * `fresh_session` is used by "use different account": macOS uses an ephemeral
+ * ASWebAuthenticationSession and Windows/Linux use a throwaway webview profile.
  * Returns the device code when this call started the browser device-code flow,
  * and an empty string for every path that needs no out-of-band confirmation
  * (macOS auth session, embedded WebView fallback).
@@ -1890,7 +1889,9 @@ async piStop(sessionId: string | null) : Promise<Result<PiInfo, string>> {
  * Chat panels call this when they give up foreground ownership. Keeping every
  * completed ACP conversation resident leaves a full Bun/Node/agent process
  * tree behind for each chat. The busy check and removal happen under the pool
- * lock, so a prompt cannot race between the check and teardown.
+ * lock, so a prompt cannot race between the check and teardown. Sessions that
+ * are still initializing are kept until they report ready; if the panel
+ * already released them, a deferred reap runs after the first prompt can land.
  */
 async piStopIfIdle(sessionId: string | null) : Promise<Result<PiInfo, string>> {
     try {
@@ -2243,6 +2244,18 @@ async resizeSearchWindow(width: number, height: number) : Promise<Result<null, s
  */
 async restartAfterScreenRecordingPermission() : Promise<void> {
     await TAURI_INVOKE("restart_after_screen_recording_permission");
+},
+/**
+ * Restart the app after an explicit user action so an exact short-read
+ * quarantine can be verified in a fresh process before recording resumes.
+ */
+async restartDatabaseVerification() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_database_verification") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 /**
  * Banner-click restart. Mirror the auto-update path: gate, stop server, then
@@ -2967,6 +2980,17 @@ async vaultUnlock(password: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Record that a webview renderer's main event loop is responsive.
+ *
+ * The macOS renderer watchdog compares this monotonic heartbeat with the
+ * moment a window was shown. If WebKit wedges while submitting a paint to its
+ * GPU process, JavaScript cannot advance its event loop and the native shell
+ * can rebuild the stale UI without restarting capture.
+ */
+async webviewRendererHeartbeat() : Promise<void> {
+    await TAURI_INVOKE("webview_renderer_heartbeat");
+},
+/**
  * Write the exclusion list atomically (write-to-tmp + rename) so the
  * engine's 500 ms mtime poll never observes a half-written file. The
  * engine picks up the new list on the next tick subject to its
@@ -3316,7 +3340,13 @@ export type OnboardingStore = { isCompleted: boolean; completedAt: string | null
  * Current step in onboarding flow (login, intro, usecases, status)
  * Used to resume after app restart (e.g., after granting permissions)
  */
-currentStep?: string | null; firstRunSummaryPhase?: string; firstRunSummaryStartedAt?: string | null; firstRunSummaryChatId?: string | null; firstRunSummaryNotificationSentAt?: string | null; firstRunSummaryNotificationId?: string | null; firstRunSummaryError?: string | null; firstRunSummaryTelemetryVersion?: number }
+currentStep?: string | null; firstRunSummaryPhase?: string; firstRunSummaryStartedAt?: string | null; firstRunSummaryChatId?: string | null; firstRunSummaryNotificationSentAt?: string | null; firstRunSummaryNotificationId?: string | null; firstRunSummaryError?: string | null; firstRunSummaryTelemetryVersion?: number;
+/**
+ * Written only when this app version creates the install's first
+ * onboarding record. Existing records deserialize to false, and reset
+ * clears it, so onboarding replay can never enter the experiment.
+ */
+trialActivationFreshInstall?: boolean }
 /**
  * Snapshot of a pending update, exposed to the frontend via
  * `get_pending_update`. The banner queries this on mount so it can hydrate
@@ -3346,8 +3376,9 @@ acpCompatible: boolean }
 export type PiImageContent = { type: string; mimeType: string; data: string }
 export type PiInfo = { running: boolean;
 /**
- * True while this session has a prompt, queued follow-up, or pending RPC
- * response. Destructive settings use it to avoid clearing live context.
+ * True while this session is still initializing, or has a prompt, queued
+ * follow-up, or pending RPC response. Destructive settings use it to
+ * avoid clearing live context.
  */
 busy: boolean; projectDir: string | null; pid: number | null; sessionId: string | null;
 /**

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "suite": "screenpipe-app-coding-agent-regressions",
-  "dataset_version": "2026-08-28.1",
+  "dataset_version": "2026-09-01.1",
   "suite_type": "regression",
   "owner": "screenpipe engineering",
   "policy": {
@@ -734,6 +734,141 @@
           }
         ],
         "command": "cd apps/screenpipe-app-tauri && NODE_OPTIONS=--localstorage-file=.eval-localstorage bun x vitest run --config vitest.config.ts lib/__tests__/pi-event-router.pool-eviction-eval.test.ts lib/__tests__/pi-event-router.test.ts components/chat/standalone/hooks/use-chat-session-runtime.test.tsx lib/__tests__/chat-store.test.ts"
+      }
+    },
+    {
+      "id": "app-chat-overlapping-load-isolation",
+      "name": "Keep overlapping chat loads isolated",
+      "source": {
+        "kind": "git_regression",
+        "fix_commit": "3aa56c5a12d7797f83d523ffdd045fa17ac232cf",
+        "pull_request": "https://github.com/screenpipe/screenpipe/pull/6772"
+      },
+      "base_ref": "10ae49880fcb8d072bc17b2c08522f1e4ec1f1d1",
+      "oracle_ref": "3aa56c5a12d7797f83d523ffdd045fa17ac232cf",
+      "oracle_paths": [
+        "apps/screenpipe-app-tauri/components/hooks/use-chat-conversations.ts"
+      ],
+      "gate": "advisory",
+      "trigger_paths": [
+        "apps/screenpipe-app-tauri/components/hooks/use-chat-conversations.ts",
+        "apps/screenpipe-app-tauri/lib/stores/chat-store.ts",
+        "apps/screenpipe-app-tauri/lib/chat-storage.ts"
+      ],
+      "tags": ["regression", "escaped-failure", "chat", "navigation", "concurrency", "data-corruption", "state-isolation"],
+      "prompt": "Rapid chat navigation can start a second conversation load while the first still awaits metadata or disk work. The eager session reference then points at the requested chat while the rendered transcript still belongs to the outgoing chat, so the wrong messages can be saved under another conversation and a stale request can reclaim the foreground. Bind every outgoing snapshot to the conversation and messages still rendered, and allow only the newest navigation to commit panel, current-session, settings, and preset state after asynchronous work. Keep each conversation's stored messages unchanged, leave the newest chat in the foreground when an older load finishes late, and preserve single-load behavior, temporary side-chat boundaries, stable ID fallbacks, concurrent save merging, browser state, and user-message timestamps.",
+      "agent_timeout_seconds": 1200,
+      "grader_dependency_links": [
+        { "source_path": "apps/screenpipe-app-tauri/node_modules", "destination_path": "apps/screenpipe-app-tauri/node_modules" }
+      ],
+      "grader": {
+        "timeout_seconds": 420,
+        "fixtures": [
+          { "source_path": "apps/screenpipe-app-tauri/lib/__tests__/save-conversation-race.test.tsx" }
+        ],
+        "command": "cd apps/screenpipe-app-tauri && NODE_OPTIONS=--localstorage-file=.eval-localstorage bun x vitest run --config vitest.config.ts lib/__tests__/save-conversation-race.test.tsx"
+      }
+    },
+    {
+      "id": "app-chat-renderer-reload-hydration",
+      "name": "Hydrate a saved chat after renderer reload",
+      "source": {
+        "kind": "git_regression",
+        "fix_commit": "4bc33459becbdf0f824243a1600aa6263f174768",
+        "pull_request": "https://github.com/screenpipe/screenpipe/pull/6766"
+      },
+      "base_ref": "664233bf1df466feafdcea117fb26f2787df7786",
+      "oracle_ref": "4bc33459becbdf0f824243a1600aa6263f174768",
+      "oracle_paths": [
+        "apps/screenpipe-app-tauri/components/chat/standalone/hooks/use-chat-window-events.ts",
+        "apps/screenpipe-app-tauri/components/standalone-chat.tsx"
+      ],
+      "gate": "advisory",
+      "trigger_paths": [
+        "apps/screenpipe-app-tauri/components/chat/standalone/hooks/use-chat-window-events.ts",
+        "apps/screenpipe-app-tauri/components/standalone-chat.tsx",
+        "apps/screenpipe-app-tauri/lib/stores/chat-store.ts",
+        "apps/screenpipe-app-tauri/lib/chat-storage.ts"
+      ],
+      "tags": ["regression", "escaped-failure", "chat", "renderer-reload", "hydration", "false-empty", "state-recovery"],
+      "prompt": "After a chat renderer reload, the selected tab and conversation metadata can recover before the message pane. Routing sees that the requested conversation ID already matches the current session and returns early forever, leaving a blank transcript even though the saved conversation still contains messages. Treat matching IDs as complete only when the current view has renderable state; otherwise hydrate the known saved conversation instead of replacing it with a fresh blank chat. Preserve the fast path and current-session notification when the transcript is already rendered.",
+      "agent_timeout_seconds": 900,
+      "grader_dependency_links": [
+        { "source_path": "apps/screenpipe-app-tauri/node_modules", "destination_path": "apps/screenpipe-app-tauri/node_modules" }
+      ],
+      "grader": {
+        "timeout_seconds": 300,
+        "fixtures": [
+          { "source_path": "apps/screenpipe-app-tauri/components/chat/standalone/hooks/use-chat-window-events.test.tsx" }
+        ],
+        "command": "cd apps/screenpipe-app-tauri && NODE_OPTIONS=--localstorage-file=.eval-localstorage bun x vitest run --config vitest.config.ts components/chat/standalone/hooks/use-chat-window-events.test.tsx"
+      }
+    },
+    {
+      "id": "app-pipe-history-tool-call-rendering",
+      "name": "Render tool activity from saved pipe history",
+      "source": {
+        "kind": "git_regression",
+        "fix_commit": "ce59063b095bc54ddad910938b0c77bcd9a46a24"
+      },
+      "base_ref": "d0b2d298c1c5167eb843b32f8e08939ee54badce",
+      "oracle_ref": "ce59063b095bc54ddad910938b0c77bcd9a46a24",
+      "oracle_paths": [
+        "apps/screenpipe-app-tauri/lib/pipe-ndjson-to-chat.ts"
+      ],
+      "gate": "advisory",
+      "trigger_paths": [
+        "apps/screenpipe-app-tauri/lib/pipe-ndjson-to-chat.ts",
+        "apps/screenpipe-app-tauri/components/chat/**"
+      ],
+      "tags": ["regression", "escaped-failure", "pipes", "chat", "tool-call", "rendering", "false-empty", "ndjson"],
+      "prompt": "Saved pipe execution history can contain valid assistant tool calls and results, but the chat view renders empty bubbles instead of showing what the pipe did. Make each parsed completed tool call render with its name and structured arguments, and attach its result to the same tool activity. Recover the name and arguments when streaming deltas are thin but the completed event contains them, and keep oversized results bounded. Preserve ordinary text, thinking, multi-turn ordering, agent-end fallback, malformed or truncated input, empty input, tool-result deduplication, unique message IDs, and conversation metadata.",
+      "agent_timeout_seconds": 900,
+      "grader_dependency_links": [
+        { "source_path": "apps/screenpipe-app-tauri/node_modules", "destination_path": "apps/screenpipe-app-tauri/node_modules" }
+      ],
+      "grader": {
+        "timeout_seconds": 420,
+        "fixtures": [
+          { "source_path": "apps/screenpipe-app-tauri/components/__tests__/pipe-ndjson-to-chat.test.ts" }
+        ],
+        "command": "cd apps/screenpipe-app-tauri && bun x vitest run --config vitest.config.ts components/__tests__/pipe-ndjson-to-chat.test.ts"
+      }
+    },
+    {
+      "id": "app-log-share-redaction-false-positive",
+      "name": "Preserve accessibility telemetry while redacting shared logs",
+      "source": {
+        "kind": "git_regression",
+        "fix_commit": "08feb4df5db8c6d95f58f5f1fe02930a450885c3"
+      },
+      "base_ref": "3828e565d41de1df99a24c26e69da0121f8c71c1",
+      "oracle_ref": "08feb4df5db8c6d95f58f5f1fe02930a450885c3",
+      "oracle_paths": [
+        "apps/screenpipe-app-tauri/components/share-logs-button.tsx",
+        "apps/screenpipe-app-tauri/lib/utils/redact-pii.ts"
+      ],
+      "gate": "advisory",
+      "trigger_paths": [
+        "apps/screenpipe-app-tauri/components/share-logs-button.tsx",
+        "apps/screenpipe-app-tauri/lib/utils/redact-pii.ts",
+        "crates/screenpipe-core/src/pii_removal.rs"
+      ],
+      "tags": ["regression", "escaped-failure", "privacy", "log-sharing", "redaction", "accessibility", "false-positive", "data-integrity"],
+      "prompt": "A shared support bundle includes recent chat context after removing personal information, but its phone-number detector also replaces bare accessibility coordinates and numeric telemetry. Preserve structured bounds, frame and monitor identifiers, hashes, process identifiers, pixel dimensions, and other unformatted numeric values in the uploaded bundle. Continue to remove formatted phone numbers, email addresses, government identifiers, payment-card numbers, bearer tokens, API credentials, IP addresses, and home-directory usernames. Do not solve the problem by disabling redaction or omitting the chat context.",
+      "agent_timeout_seconds": 900,
+      "grader_dependency_links": [
+        { "source_path": "apps/screenpipe-app-tauri/node_modules", "destination_path": "apps/screenpipe-app-tauri/node_modules" }
+      ],
+      "grader": {
+        "timeout_seconds": 420,
+        "fixtures": [
+          {
+            "local_path": "graders/app-log-share-redaction.test.tsx",
+            "destination_path": "apps/screenpipe-app-tauri/components/__tests__/app-log-share-redaction.eval.test.tsx"
+          }
+        ],
+        "command": "cd apps/screenpipe-app-tauri && bun x vitest run --config vitest.config.ts components/__tests__/app-log-share-redaction.eval.test.tsx"
       }
     }
   ]

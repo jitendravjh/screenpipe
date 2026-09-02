@@ -12,7 +12,10 @@ pub(crate) mod overlay_anchor;
 use crate::{
     analytics::{AnalyticsManager, Attribution},
     native_notification, native_shortcut_reminder,
-    store::{OnboardingStore, SettingsStore},
+    store::{
+        OnboardingStore, SettingsStore, TRIAL_ACTIVATION_PAYWALL_STEP,
+        TRIAL_ACTIVATION_SUMMARY_STEP, TRIAL_ACTIVATION_UNLOCKED_STEP,
+    },
     updates::is_enterprise_build,
     window::{RewindWindowId, ShowRewindWindow},
 };
@@ -21,7 +24,6 @@ use crate::window::GatedPanelPlacement;
 use crate::window::GatedWindowPlacement;
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
-#[cfg(not(target_os = "macos"))]
 use tauri_plugin_opener::OpenerExt;
 use tracing::{debug, error, info, warn};
 
@@ -536,6 +538,14 @@ pub fn get_app_server_config() -> serde_json::Value {
 #[specta::specta]
 pub fn start_database_recovery(app_handle: tauri::AppHandle) -> Result<(), String> {
     crate::db_recovery_notifications::start_quarantined_database_recovery(app_handle)
+}
+
+/// Restart the app after an explicit user action so an exact short-read
+/// quarantine can be verified in a fresh process before recording resumes.
+#[tauri::command]
+#[specta::specta]
+pub fn restart_database_verification(app_handle: tauri::AppHandle) -> Result<(), String> {
+    crate::db_recovery_notifications::restart_quarantined_database_verification(app_handle)
 }
 
 /// Pure JSON shape used by the cold-spawn fallback. Extracted so the contract
@@ -1918,12 +1928,11 @@ fn reset_existing_login_window<R: tauri::Runtime>(
 }
 
 /// Open the screenpipe.com login page.
-/// macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
-/// Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
+/// Normal login opens the user's default browser and returns through the
+/// versioned app-specific deep-link callback.
 ///
-/// `fresh_session` is used by "use different account": macOS asks
-/// ASWebAuthenticationSession for an ephemeral browser session instead of
-/// reusing Safari cookies, and Windows/Linux use a throwaway webview profile.
+/// `fresh_session` is used by "use different account": macOS uses an ephemeral
+/// ASWebAuthenticationSession and Windows/Linux use a throwaway webview profile.
 #[tauri::command]
 #[specta::specta]
 /// Returns the device code when this call started the browser device-code flow,
@@ -1943,12 +1952,40 @@ pub async fn open_login_window(
     let fresh_session = fresh_session.unwrap_or(false);
     #[cfg(target_os = "macos")]
     {
-        // ASWebAuthenticationSession intercepts the redirect itself (no OS
-        // scheme routing), but still use the same versioned build scheme as
-        // Windows/Linux so the website contract is identical everywhere.
         let callback_scheme = deep_link_scheme();
+        let login_url = login_url_with_intent(auth_mode, Some(callback_scheme))?;
+
+        // Normal sign-in belongs in the user's preferred browser. It already
+        // has their password manager, passkeys and Google/GitHub sessions, and
+        // it is also where a prior screenpipe.com acquisition cookie is most
+        // likely to live. The website returns the token through the versioned,
+        // build-specific scheme handled by the existing cold/warm deep-link
+        // paths.
+        //
+        // "Use different account" deliberately stays in an ephemeral Apple
+        // auth session so it cannot silently reuse the browser's current user.
+        if !fresh_session {
+            match app_handle
+                .opener()
+                .open_url(login_url.as_str(), None::<&str>)
+            {
+                Ok(()) => {
+                    info!("opened system browser for login");
+                    return Ok(String::new());
+                }
+                Err(e) => {
+                    // Keep the previous, reliable native auth path when macOS
+                    // cannot launch a default browser.
+                    warn!("could not open system browser, falling back to auth session: {e}");
+                }
+            }
+        }
+
+        // ASWebAuthenticationSession intercepts the redirect itself (no OS
+        // scheme routing). It remains the isolated-account path and the
+        // launch-failure fallback.
         let callback_url = match crate::auth_session::start_session(
-            login_url_with_intent(auth_mode, Some(callback_scheme))?,
+            login_url,
             callback_scheme.to_string(),
             fresh_session,
         )
@@ -2750,6 +2787,7 @@ pub async fn complete_onboarding(app_handle: tauri::AppHandle) -> Result<(), Str
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     close_window(app_handle.clone(), ShowRewindWindow::Onboarding).await?;
     crate::first_run_summary::arm(&app_handle)?;
+    let _ = refresh_tray_menu(app_handle.clone()).await;
 
     // Hidden UI applies to the main app, but incomplete onboarding remains
     // visible long enough to finish permissions. Once onboarding completes,
@@ -2797,9 +2835,36 @@ pub async fn reset_onboarding(app_handle: tauri::AppHandle) -> Result<(), String
 #[tauri::command]
 #[specta::specta]
 pub async fn set_onboarding_step(app_handle: tauri::AppHandle, step: String) -> Result<(), String> {
+    let previous_step = OnboardingStore::get(&app_handle)
+        .ok()
+        .flatten()
+        .and_then(|onboarding| onboarding.current_step);
     OnboardingStore::update(&app_handle, |onboarding| {
-        onboarding.current_step = Some(step);
+        onboarding.current_step = Some(step.clone());
+        if step == TRIAL_ACTIVATION_SUMMARY_STEP
+            && crate::store::trial_activation_dev_force_enabled()
+        {
+            onboarding.trial_activation_fresh_install = true;
+        }
     })?;
+    let _ = refresh_tray_menu(app_handle.clone()).await;
+
+    if !crate::should_skip_onboarding() && step == TRIAL_ACTIVATION_PAYWALL_STEP {
+        let state = app_handle.state::<crate::recording::RecordingState>();
+        crate::recording::stop_capture(state, app_handle.clone()).await?;
+        let _ = app_handle.emit("trial-activation-state", "paywall");
+    } else if step == TRIAL_ACTIVATION_UNLOCKED_STEP
+        && previous_step.as_deref() == Some(TRIAL_ACTIVATION_PAYWALL_STEP)
+    {
+        let _ = app_handle.emit("trial-activation-state", "trial-unlocked");
+        let recording_app = app_handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = recording_app.state::<crate::recording::RecordingState>();
+            if let Err(error) = crate::spawn_screenpipe(state, recording_app.clone(), None).await {
+                warn!("failed to restart capture after trial activation: {error}");
+            }
+        });
+    }
     Ok(())
 }
 
@@ -3257,6 +3322,17 @@ pub(crate) async fn show_shortcut_reminder_impl(
     let label = "shortcut-reminder";
 
     info!("show_shortcut_reminder called");
+
+    let trial_locked = !crate::should_skip_onboarding()
+        && OnboardingStore::get(&app_handle)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .blocks_trial_activation_app();
+    if trial_locked {
+        info!("trial activation: suppressed shortcut reminder overlay");
+        return Ok(());
+    }
 
     // The screenpipe shortcut only opens the timeline/rewind overlay, so the
     // reminder is pointless when the timeline is disabled. Suppress it here so

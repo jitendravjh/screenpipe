@@ -8,7 +8,7 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { commands } from "@/lib/utils/tauri";
 import { motion, AnimatePresence } from "framer-motion";
 import posthog from "posthog-js";
-import { isDevBillingBypassEnabled } from "@/lib/app-entitlement";
+import { isDevLoginSkipEnabled } from "@/lib/app-entitlement";
 import { ArrowRight } from "lucide-react";
 import { LOCALITY_DETAIL } from "./trust-disclosure";
 
@@ -246,7 +246,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({
   const [browserFailure, setBrowserFailure] = useState<string | null>(null);
   const bgRef = useRef<HTMLCanvasElement>(null);
   const btnRef = useRef<HTMLCanvasElement>(null);
-  const canSkipLogin = isDevBillingBypassEnabled();
+  const canSkipLogin = isDevLoginSkipEnabled();
 
   const isLoggedIn = !!settings.user?.token;
   // null until settings hydrate — SettingsProvider starts from defaults (no
@@ -285,11 +285,10 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({
   const handleLogin = useCallback(() => {
     posthog.capture("onboarding_login_clicked");
     setBrowserFailure(null);
-    // macOS: ASWebAuthenticationSession (shares Safari's session).
-    // Windows/Linux: the user's real default browser, so the session they
-    // already have with Google/etc. is reused instead of asking them to
-    // re-type credentials into a cold embedded WebView. Either way the token
-    // comes back on the screenpipe:// deep link; nothing is typed by hand.
+    // The user's real default browser reuses the session they already have
+    // with Google/etc. instead of asking them to re-type credentials in a cold
+    // embedded browser. The token comes back on the versioned app-specific
+    // deep link; nothing is typed by hand.
     const authMode = suppressAutoAdvance ? "sign-in" : "sign-up";
     void commands
       .openLoginWindow(null, authMode)

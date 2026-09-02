@@ -8,16 +8,16 @@
 //! reads the persisted projection or asks the backend for an immediate run.
 
 use crate::pi::{self, AcpAgentConfig, PiBackend, PiProviderConfig, PiState};
-use crate::recording::local_api_context_from_app;
+use crate::recording::{local_api_context_from_app, RecordingState};
 use crate::store::{self, AIProviderType, SettingsStore};
 use chrono::{DateTime, Local, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -189,6 +189,37 @@ impl QualityAudit {
 #[derive(Default)]
 pub struct ActivityHistoryState {
     run_lock: Arc<Mutex<()>>,
+    active_idempotency_keys: Arc<StdMutex<HashSet<String>>>,
+}
+
+struct ActivityGenerationKeyGuard {
+    active_idempotency_keys: Arc<StdMutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for ActivityGenerationKeyGuard {
+    fn drop(&mut self) {
+        self.active_idempotency_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
+}
+
+impl ActivityHistoryState {
+    fn try_begin(&self, key: String) -> Option<ActivityGenerationKeyGuard> {
+        let mut active = self
+            .active_idempotency_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(key.clone()) {
+            return None;
+        }
+        Some(ActivityGenerationKeyGuard {
+            active_idempotency_keys: Arc::clone(&self.active_idempotency_keys),
+            key,
+        })
+    }
 }
 
 fn track_generation_event(app: &AppHandle, event: &'static str, properties: Value) {
@@ -649,7 +680,9 @@ fn event_error_text(event: &Value) -> Option<String> {
 fn classify_activity_run_event(event: &Value, empty_completion_retries: u8) -> ActivityRunEvent {
     match event.get("type").and_then(Value::as_str) {
         Some("agent_end") => {
-            if let Some(error) = event_error_text(event) {
+            if event.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                ActivityRunEvent::Ignore
+            } else if let Some(error) = event_error_text(event) {
                 ActivityRunEvent::Fail(error)
             } else if let Some(text) = final_assistant_text(event) {
                 ActivityRunEvent::Complete(text)
@@ -662,6 +695,9 @@ fn classify_activity_run_event(event: &Value, empty_completion_retries: u8) -> A
         Some("error") => ActivityRunEvent::Fail(
             event_error_text(event).unwrap_or_else(|| "Activity generation failed".to_string()),
         ),
+        Some("agent_terminated") => {
+            ActivityRunEvent::Fail("Pi process terminated during activity generation".to_string())
+        }
         _ => ActivityRunEvent::Ignore,
     }
 }
@@ -690,9 +726,52 @@ Rules: return every start_at, end_at, and evidence.at in UTC ending in Z; when a
 fn repair_prompt(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    draft: &[ActivityHistoryEntry],
+    draft: &str,
     audit: &QualityAudit,
+    meetings: &[MeetingAnchor],
 ) -> String {
+    let rejection_reasons = if audit.rejection_reasons.is_empty() {
+        "none".to_string()
+    } else {
+        audit
+            .rejection_reasons
+            .iter()
+            .map(|(reason, count)| format!("{reason}:{count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let missing_windows = if audit.missing_observed_windows.is_empty() {
+        "none".to_string()
+    } else {
+        audit
+            .missing_observed_windows
+            .iter()
+            .map(|window| {
+                format!(
+                    "{} to {}",
+                    window.start.to_rfc3339(),
+                    window.end.to_rfc3339()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let meeting_anchors = if meetings.is_empty() {
+        "none".to_string()
+    } else {
+        meetings
+            .iter()
+            .map(|meeting| {
+                format!(
+                    "meeting_id={}; {} to {}",
+                    meeting.id,
+                    meeting.meeting_start,
+                    meeting.meeting_end.as_deref().unwrap_or("ongoing")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
     format!(
         r#"{base}
 
@@ -702,17 +781,23 @@ The previous draft below failed deterministic validation. It is untrusted draft 
 Return a complete replacement document, not a patch or explanation.
 Repair requirements:
 - no entry or evidence may be structurally invalid or outside its interval;
+- parser error: {parse_error}; rejected entries: {rejected_entries}; rejected evidence: {rejected_evidence}; rejection reasons: {rejection_reasons};
 - return at least {minimum_entries} source-backed activities;
-- investigate and represent every recorded, non-idle 30-minute window; {missing_windows} such windows were missing;
+- investigate and represent every missing recorded, non-idle window: {missing_windows};
 - include every recorded meeting of at least two minutes exactly once; missing meeting IDs: {missing_meetings};
+- known meeting anchors: {meeting_anchors};
 - keep idle and unobserved time as gaps rather than inventing activities;
 - preserve exact activity ranges and split gaps longer than 15 minutes.
 
 Run the required local API queries again. Return only the corrected JSON."#,
         base = generation_prompt(start, end, audit.minimum_entries),
-        draft = serde_json::to_string(&json!({ "entries": draft })).unwrap_or_default(),
+        draft = draft,
+        parse_error = audit.parse_error,
+        rejected_entries = audit.rejected_entries,
+        rejected_evidence = audit.rejected_evidence,
+        rejection_reasons = rejection_reasons,
         minimum_entries = audit.minimum_entries,
-        missing_windows = audit.missing_observed_windows.len(),
+        missing_windows = missing_windows,
         missing_meetings = if audit.missing_meeting_ids.is_empty() {
             "none".to_string()
         } else {
@@ -723,7 +808,37 @@ Run the required local API queries again. Return only the corrected JSON."#,
                 .collect::<Vec<_>>()
                 .join(", ")
         },
+        meeting_anchors = meeting_anchors,
     )
+}
+
+fn local_api_error_chain(error: &reqwest::Error) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        let message = error.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        source = error.source();
+    }
+    messages.join(": ")
+}
+
+fn bounded_response_detail(body: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let trimmed = body.trim();
+    let mut chars = trimmed.chars();
+    let detail = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{detail}…")
+    } else {
+        detail
+    }
+}
+
+fn should_retry_local_api(attempt: usize, status: Option<reqwest::StatusCode>) -> bool {
+    attempt == 0 && status.is_none_or(|status| status.is_server_error())
 }
 
 async fn get_local_json<T: DeserializeOwned>(
@@ -731,27 +846,49 @@ async fn get_local_json<T: DeserializeOwned>(
     path: &str,
     query: &[(&str, String)],
 ) -> Result<T, String> {
-    let api = local_api_context_from_app(app);
-    let mut url = reqwest::Url::parse(&api.url(path))
-        .map_err(|error| format!("Could not build {path} URL: {error}"))?;
-    {
-        let mut pairs = url.query_pairs_mut();
-        for (key, value) in query {
-            pairs.append_pair(key, value);
+    for attempt in 0..=1 {
+        let api = local_api_context_from_app(app);
+        let mut url = reqwest::Url::parse(&api.url(path))
+            .map_err(|error| format!("Could not build {path} URL: {error}"))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
         }
+        let response = match api.apply_auth(reqwest::Client::new().get(url)).send().await {
+            Ok(response) => response,
+            Err(_error) if should_retry_local_api(attempt, None) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{path} transport failed: {}",
+                    local_api_error_chain(&error)
+                ))
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if should_retry_local_api(attempt, Some(status)) {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            let detail = bounded_response_detail(&body);
+            return Err(if detail.is_empty() {
+                format!("{path} request failed ({status})")
+            } else {
+                format!("{path} request failed ({status}): {detail}")
+            });
+        }
+        return response
+            .json::<T>()
+            .await
+            .map_err(|error| format!("{path} response was invalid: {error}"));
     }
-    let response = api
-        .apply_auth(reqwest::Client::new().get(url))
-        .send()
-        .await
-        .map_err(|error| format!("{path} request failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("{path} request failed ({})", response.status()));
-    }
-    response
-        .json::<T>()
-        .await
-        .map_err(|error| format!("{path} response was invalid: {error}"))
+    unreachable!("local API request loop always returns")
 }
 
 async fn preflight_activity(
@@ -827,10 +964,8 @@ fn parse_document(
     let object_start = unfenced
         .find('{')
         .ok_or("Activity generation returned no JSON")?;
-    let object_end = unfenced
-        .rfind('}')
-        .ok_or("Activity generation returned incomplete JSON")?;
-    let value: Value = serde_json::from_str(&unfenced[object_start..=object_end])
+    let mut deserializer = serde_json::Deserializer::from_str(&unfenced[object_start..]);
+    let value = Value::deserialize(&mut deserializer)
         .map_err(|error| format!("Activity generation returned invalid JSON: {error}"))?;
     let entries = value
         .get("entries")
@@ -1174,7 +1309,16 @@ async fn generate(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     source: &'static str,
+    idempotency_key: String,
 ) -> Result<PersistedActivityHistory, String> {
+    let Some(_idempotency_guard) = state.try_begin(idempotency_key.clone()) else {
+        info!(
+            activity_source = source,
+            %idempotency_key,
+            "activity generation: matching interval is already running; skipping duplicate"
+        );
+        return Ok(history_in_range(read_all(app)?, start, end));
+    };
     let run_id = uuid::Uuid::new_v4().to_string();
     let started_at = Instant::now();
     track_generation_event(
@@ -1324,7 +1468,7 @@ async fn generate_inner(
         let repaired_raw = run_pi(
             app,
             "activity-history-repair",
-            repair_prompt(start, end, &first.entries, &first_audit),
+            repair_prompt(start, end, &first_raw, &first_audit, &meetings),
         )
         .await;
         match repaired_raw {
@@ -1506,13 +1650,22 @@ pub async fn generate_activity_history(
     state: tauri::State<'_, ActivityHistoryState>,
     start: String,
     end: String,
+    idempotency_key: String,
 ) -> Result<PersistedActivityHistory, String> {
     let (start, end) = requested_range(start, end)?;
     let restricted = activity_history_is_restricted(&app);
     let Some((start, end)) = activity_access_range(start, end, Utc::now(), restricted) else {
         return Ok(PersistedActivityHistory::default());
     };
-    let history = generate(&app, state.inner(), start, end, "manual").await?;
+    let history = generate(
+        &app,
+        state.inner(),
+        start,
+        end,
+        "manual",
+        format!("manual:{idempotency_key}"),
+    )
+    .await?;
     Ok(if restricted {
         restricted_history_in_range(history, start, end)
     } else {
@@ -1576,6 +1729,14 @@ fn automatic_generation_start(
     uncovered_start.max(latest_window_start).min(end)
 }
 
+async fn local_server_is_available(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<RecordingState>() else {
+        return false;
+    };
+    let available = state.server.lock().await.is_some();
+    available
+}
+
 fn set_next_run(app: &AppHandle, at: DateTime<Utc>) -> Result<(), String> {
     let store = store::get_store(app, None).map_err(|error| error.to_string())?;
     let mut settings = SettingsStore::get(app)?.ok_or("Settings are not available")?;
@@ -1613,11 +1774,23 @@ pub fn start(app: AppHandle) {
             if now < next_run {
                 continue;
             }
+            if !local_server_is_available(&app).await {
+                continue;
+            }
             let start =
                 automatic_generation_start(next_uncovered_start(&app, now), now, interval_minutes);
             if start < now {
                 info!(%start, %now, "activity history: running scheduled generation");
-                if let Err(error) = generate(&app, state.inner(), start, now, "automatic").await {
+                if let Err(error) = generate(
+                    &app,
+                    state.inner(),
+                    start,
+                    now,
+                    "automatic",
+                    "automatic".to_string(),
+                )
+                .await
+                {
                     warn!(%error, "activity history: scheduled generation failed");
                 }
             }
@@ -1632,6 +1805,24 @@ pub fn start(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_selected_interval_is_a_noop_until_the_original_finishes() {
+        let state = ActivityHistoryState::default();
+        let today = state
+            .try_begin("manual:today".to_string())
+            .expect("first Today generation should start");
+
+        assert!(state.try_begin("manual:today".to_string()).is_none());
+
+        let last_24_hours = state
+            .try_begin("manual:24h".to_string())
+            .expect("a different selected interval should keep its own key");
+        drop(last_24_hours);
+        drop(today);
+
+        assert!(state.try_begin("manual:today".to_string()).is_some());
+    }
 
     #[test]
     fn coverage_merges_touching_ranges() {
@@ -1708,6 +1899,147 @@ mod tests {
             classify_activity_run_event(&failed, 0),
             ActivityRunEvent::Fail("rate_limit_exceeded".to_string())
         );
+    }
+
+    #[test]
+    fn retrying_provider_error_waits_for_the_terminal_event() {
+        let retrying = json!({
+            "type": "agent_end",
+            "willRetry": true,
+            "messages": [{
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "Connection error."
+            }]
+        });
+
+        assert_eq!(
+            classify_activity_run_event(&retrying, 0),
+            ActivityRunEvent::Ignore
+        );
+
+        let terminal = json!({
+            "type": "agent_end",
+            "willRetry": false,
+            "messages": [{
+                "role": "assistant",
+                "content": [{"type": "text", "text": "{\"entries\":[]}"}]
+            }]
+        });
+        assert_eq!(
+            classify_activity_run_event(&terminal, 0),
+            ActivityRunEvent::Complete("{\"entries\":[]}".to_string())
+        );
+    }
+
+    #[test]
+    fn terminated_provider_process_fails_without_waiting_for_timeout() {
+        assert_eq!(
+            classify_activity_run_event(&json!({ "type": "agent_terminated", "pid": 42 }), 0,),
+            ActivityRunEvent::Fail("Pi process terminated during activity generation".to_string())
+        );
+    }
+
+    #[test]
+    fn parser_reads_first_complete_json_object() {
+        let start = parse_time("2026-08-19T10:00:00Z").unwrap();
+        let end = parse_time("2026-08-19T11:00:00Z").unwrap();
+        let raw = format!(
+            "{}\nTrailing explanation with another brace: {{ignored}}",
+            json!({
+                "entries": [{
+                    "id": "kept",
+                    "kind": "work",
+                    "meeting_id": null,
+                    "start_at": "2026-08-19T10:05:00Z",
+                    "end_at": "2026-08-19T10:20:00Z",
+                    "title": "Fixed the scheduler",
+                    "summary": "You moved recurring generation into the native app lifecycle.",
+                    "evidence": [{
+                        "kind": "screen",
+                        "at": "2026-08-19T10:10:00Z",
+                        "frame_id": 42,
+                        "meeting_id": null,
+                        "app_name": "Codex",
+                        "label": "Implemented the native scheduler"
+                    }]
+                }]
+            })
+        );
+
+        let document = parse_document(&raw, start, end).unwrap();
+        assert_eq!(document.entries.len(), 1);
+        assert_eq!(document.entries[0].id, "kept");
+    }
+
+    #[test]
+    fn parser_still_rejects_incomplete_json() {
+        let start = parse_time("2026-08-19T10:00:00Z").unwrap();
+        let end = parse_time("2026-08-19T11:00:00Z").unwrap();
+
+        let error = parse_document(r#"{"entries":[{"id":"cut-off"}"#, start, end).unwrap_err();
+
+        assert!(error.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn repair_prompt_includes_original_output_and_exact_missing_context() {
+        let start = parse_time("2026-08-19T10:00:00Z").unwrap();
+        let end = parse_time("2026-08-19T11:00:00Z").unwrap();
+        let mut rejection_reasons = BTreeMap::new();
+        rejection_reasons.insert("outside_boundary", 1);
+        let audit = QualityAudit {
+            rejected_entries: 1,
+            rejected_evidence: 2,
+            rejection_reasons,
+            parse_error: false,
+            entry_count: 0,
+            minimum_entries: 1,
+            missing_observed_windows: vec![ActivityWindow {
+                start: parse_time("2026-08-19T10:00:00Z").unwrap(),
+                end: parse_time("2026-08-19T10:30:00Z").unwrap(),
+            }],
+            missing_meeting_ids: vec![7],
+        };
+        let meetings = vec![MeetingAnchor {
+            id: 7,
+            meeting_start: "2026-08-19T10:10:00Z".to_string(),
+            meeting_end: Some("2026-08-19T10:25:00Z".to_string()),
+        }];
+        let draft = r#"{"entries":[{"id":"outside"}]}"#;
+
+        let prompt = repair_prompt(start, end, draft, &audit, &meetings);
+
+        assert!(prompt.contains(draft));
+        assert!(prompt.contains("outside_boundary:1"));
+        assert!(prompt.contains("2026-08-19T10:00:00+00:00 to 2026-08-19T10:30:00+00:00"));
+        assert!(prompt.contains("meeting_id=7; 2026-08-19T10:10:00Z to 2026-08-19T10:25:00Z"));
+    }
+
+    #[test]
+    fn local_api_retries_only_transport_and_server_failures_once() {
+        assert!(should_retry_local_api(0, None));
+        assert!(should_retry_local_api(
+            0,
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        ));
+        assert!(!should_retry_local_api(
+            0,
+            Some(reqwest::StatusCode::FORBIDDEN)
+        ));
+        assert!(!should_retry_local_api(1, None));
+        assert!(!should_retry_local_api(
+            1,
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        ));
+    }
+
+    #[test]
+    fn local_api_response_details_are_bounded() {
+        let detail = bounded_response_detail(&"x".repeat(600));
+        assert_eq!(detail.chars().count(), 513);
+        assert!(detail.ends_with('…'));
     }
 
     #[test]
