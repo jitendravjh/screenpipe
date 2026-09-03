@@ -63,13 +63,7 @@ pub const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.84.1";
 pub const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.84.1";
 pub const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
-const PI_INSTALL_ARGS: [&str; 5] = [
-    "add",
-    "--ignore-scripts",
-    PI_PACKAGE,
-    PI_AI_PACKAGE,
-    "@anthropic-ai/sdk",
-];
+const PI_INSTALL_ARGS: [&str; 3] = ["install", "--force", "--ignore-scripts"];
 const CUSTOM_PROVIDER_USER_AGENT: &str = "screenpipe";
 const GEMINI_OPENAI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 const DEFAULT_CLOUD_MAX_OUTPUT_TOKENS: u64 = 32_000;
@@ -2370,17 +2364,6 @@ impl AgentExecutor for PiExecutor {
     }
 
     async fn ensure_installed(&self) -> Result<()> {
-        if find_pi_executable().is_some() {
-            // Check if local install matches expected version; upgrade if stale
-            if !is_local_pi_version_current() {
-                info!("pi version mismatch — upgrading to {}", PI_PACKAGE);
-                // Fall through to install
-            } else {
-                debug!("pi already installed");
-                return Ok(());
-            }
-        }
-
         let bun = find_bun_executable()
             .ok_or_else(|| anyhow!("bun not found — install from https://bun.sh"))?;
 
@@ -2400,8 +2383,11 @@ impl AgentExecutor for PiExecutor {
             PI_INSTALL_ARGS.join(" "),
         );
 
-        // Seed package.json with overrides to fix lru-cache resolution on Windows
-        seed_pi_package_json(&install_dir);
+        // Keep the manifest authoritative, then rematerialize the complete tree.
+        // A prior interrupted install can leave the pinned top-level Pi package
+        // present while a transitive dependency is absent. Plain `bun install`
+        // trusts that tree, so `--force` is required to repair it generically.
+        seed_pi_package_json(&install_dir)?;
 
         let mut cmd = tokio_bun_command(&bun);
         // CREATE_NO_WINDOW only covers this Bun process. Lifecycle scripts can
@@ -3163,48 +3149,16 @@ fn apply_pi_child_path(cmd: &mut tokio::process::Command) {
     }
 }
 
-/// Check whether the locally-installed Pi version matches `PI_PACKAGE`.
-fn is_local_pi_version_current() -> bool {
-    let dir = match pi_local_install_dir() {
-        Some(d) => d,
-        None => return false,
-    };
-    let pkg_json = dir
-        .join("node_modules")
-        .join(PI_NAMESPACE_DIR)
-        .join("pi-coding-agent")
-        .join("package.json");
-    let contents = match std::fs::read_to_string(&pkg_json) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let installed = match parsed.get("version").and_then(|v| v.as_str()) {
-        Some(v) => v,
-        None => return false,
-    };
-    // PI_PACKAGE is "<scope>/pi-coding-agent@<ver>" — extract version after last '@'
-    let expected = PI_PACKAGE.rsplit('@').next().unwrap_or("");
-    if installed != expected {
-        info!(
-            "local pi version {} differs from expected {}",
-            installed, expected
-        );
-        return false;
-    }
-    true
-}
-
-/// Seed the pi-agent package.json with overrides + strip legacy deps.
+/// Seed the pi-agent package.json with pinned direct deps and overrides.
 /// `hosted-git-info` requires `lru-cache@^10`, but bun on Windows can hoist
 /// an ESM-only lru-cache@7.x that breaks CJS `require()`. Also drops any
 /// stale `@mariozechner/*` keys carried over from before the upstream
 /// namespace rename (issue #3527).
-fn seed_pi_package_json(install_dir: &Path) {
+fn seed_pi_package_json(install_dir: &Path) -> Result<()> {
     let pkg_path = install_dir.join("package.json");
+    let expected_pi_version = json!(PI_PACKAGE.rsplit('@').next().unwrap_or(""));
+    let expected_pi_ai_version = json!(PI_AI_PACKAGE.rsplit('@').next().unwrap_or(""));
+    let expected_sdk = json!("^0.91.1");
     let expected_overrides = json!({
         "hosted-git-info": {
             "lru-cache": "^10.0.0"
@@ -3242,44 +3196,74 @@ fn seed_pi_package_json(install_dir: &Path) {
                     obj.insert("overrides".to_string(), expected_overrides.clone());
                     changed = true;
                 }
-                if let Some(deps_obj) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut())
-                {
-                    let legacy: Vec<String> = deps_obj
-                        .keys()
-                        .filter(|k| k.starts_with("@mariozechner/"))
-                        .cloned()
-                        .collect();
-                    for k in &legacy {
-                        deps_obj.remove(k);
+                let deps = obj.entry("dependencies").or_insert_with(|| json!({}));
+                if !deps.is_object() {
+                    *deps = json!({});
+                    changed = true;
+                }
+                let deps_obj = deps
+                    .as_object_mut()
+                    .expect("dependencies was normalized to an object");
+                let legacy: Vec<String> = deps_obj
+                    .keys()
+                    .filter(|k| k.starts_with("@mariozechner/"))
+                    .cloned()
+                    .collect();
+                for k in &legacy {
+                    deps_obj.remove(k);
+                    changed = true;
+                }
+                for (name, version) in [
+                    ("@earendil-works/pi-coding-agent", &expected_pi_version),
+                    ("@earendil-works/pi-ai", &expected_pi_ai_version),
+                    ("@anthropic-ai/sdk", &expected_sdk),
+                ] {
+                    if deps_obj.get(name) != Some(version) {
+                        deps_obj.insert(name.to_string(), version.clone());
                         changed = true;
                     }
                 }
             }
             if changed {
-                if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
-                    let _ = std::fs::write(&pkg_path, new_contents);
-                    let _ = std::fs::remove_file(install_dir.join("bun.lock"));
-                    let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
-                    info!("Patched pi-agent package.json (overrides + legacy dep cleanup)");
-                }
+                let new_contents = serde_json::to_string_pretty(&pkg)
+                    .map_err(|e| anyhow!("failed to serialize Pi package.json: {}", e))?;
+                std::fs::write(&pkg_path, new_contents).map_err(|e| {
+                    anyhow!(
+                        "failed to write Pi package.json at {}: {}",
+                        pkg_path.display(),
+                        e
+                    )
+                })?;
+                let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+                info!("Patched pi-agent package.json (managed deps + overrides)");
             }
-            return;
+            return Ok(());
         }
     }
     let pkg_json = json!({
+        "dependencies": {
+            "@earendil-works/pi-coding-agent": expected_pi_version,
+            "@earendil-works/pi-ai": expected_pi_ai_version,
+            "@anthropic-ai/sdk": expected_sdk,
+        },
         "overrides": {
             "hosted-git-info": {
                 "lru-cache": "^10.0.0"
             }
         }
     });
-    match std::fs::write(
-        &pkg_path,
-        serde_json::to_string_pretty(&pkg_json).unwrap_or_default(),
-    ) {
-        Ok(_) => info!("Seeded pi-agent package.json with lru-cache overrides"),
-        Err(e) => warn!("Failed to seed pi-agent package.json: {}", e),
-    }
+    let contents = serde_json::to_string_pretty(&pkg_json)
+        .map_err(|e| anyhow!("failed to serialize Pi package.json: {}", e))?;
+    std::fs::write(&pkg_path, contents).map_err(|e| {
+        anyhow!(
+            "failed to write Pi package.json at {}: {}",
+            pkg_path.display(),
+            e
+        )
+    })?;
+    info!("Seeded pi-agent package.json with managed deps + overrides");
+    Ok(())
 }
 
 /// Find the JS entrypoint for the locally-installed pi package.
@@ -3442,7 +3426,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
                 let mut new_path = format!("{};{}", bun_dir.display(), current_path);
 
                 // On Windows, ensure bash is available for Pi's bash tool.
-                // ensure_bash_available: fast file-existence check first, then
+                // ensure_bash_available: bounded startup probe first, then
                 // OnceLock-guarded PortableGit download if needed (one-time ~50MB).
                 // Concurrent callers block on the single download, never duplicate.
                 if let Some(bash_dir) = ensure_bash_available() {
@@ -3583,7 +3567,115 @@ pub fn kill_process_group(pid: u32) -> Result<()> {
 /// (where bash is always available). Checks:
 /// 1. Our bundled PortableGit in %LOCALAPPDATA%\screenpipe\git-portable\
 /// 2. Standard Git for Windows install
-/// 3. bash.exe on PATH (Git Bash, MSYS2, WSL, etc.)
+/// 3. A native Windows bash.exe on PATH (Git Bash, MSYS2, etc.)
+///
+/// Windows' `System32\\bash.exe` and the WindowsApps alias are WSL launchers,
+/// not standalone shells. Treating either as usable makes Pi depend on an
+/// installed WSL distribution and prevents the PortableGit fallback.
+#[cfg(any(windows, test))]
+fn is_windows_bash_launcher(path: &str) -> bool {
+    let normalized = path
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+
+    normalized.ends_with("\\windows\\system32\\bash.exe")
+        || normalized.ends_with("\\windows\\sysnative\\bash.exe")
+        || normalized.ends_with("\\windows\\syswow64\\bash.exe")
+        || normalized.contains("\\microsoft\\windowsapps\\bash.exe")
+}
+
+#[cfg(any(windows, test))]
+fn first_usable_windows_bash_candidate<F>(stdout: &str, mut is_usable: F) -> Option<String>
+where
+    F: FnMut(&Path) -> bool,
+{
+    stdout.lines().find_map(|line| {
+        let candidate = line.trim().trim_matches('"');
+        if candidate.is_empty() || is_windows_bash_launcher(candidate) {
+            return None;
+        }
+
+        let path = Path::new(candidate);
+        is_usable(path).then(|| candidate.to_string())
+    })
+}
+
+#[cfg(windows)]
+fn bash_executable_is_usable(path: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const PROBE_OUTPUT: &[u8] = b"screenpipe-bash-ok";
+
+    let mut child = match std::process::Command::new(path)
+        .args(["--noprofile", "--norc", "-c", "printf screenpipe-bash-ok"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            warn!(
+                "bash candidate {} could not start: {}",
+                path.display(),
+                error
+            );
+            return false;
+        }
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let Some(mut pipe) = child.stdout.take() else {
+                    warn!("bash candidate {} had no stdout pipe", path.display());
+                    return false;
+                };
+                if let Err(error) = pipe.read_to_end(&mut stdout) {
+                    warn!(
+                        "bash candidate {} probe output failed: {}",
+                        path.display(),
+                        error
+                    );
+                    return false;
+                }
+                let usable = status.success() && stdout == PROBE_OUTPUT;
+                if !usable {
+                    warn!(
+                        "bash candidate {} failed its startup probe (status: {})",
+                        path.display(),
+                        status
+                    );
+                }
+                return usable;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!("bash candidate {} startup probe timed out", path.display());
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                warn!(
+                    "bash candidate {} startup probe failed: {}",
+                    path.display(),
+                    error
+                );
+                return false;
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn find_bash_executable() -> Option<String> {
     // 1. Bundled PortableGit in screenpipe's data directory
@@ -3593,7 +3685,7 @@ pub fn find_bash_executable() -> Option<String> {
             .join("git-portable")
             .join("bin")
             .join("bash.exe");
-        if bundled.exists() {
+        if bundled.exists() && bash_executable_is_usable(&bundled) {
             info!("Found bundled bash at: {}", bundled.display());
             return Some(bundled.to_string_lossy().to_string());
         }
@@ -3605,7 +3697,7 @@ pub fn find_bash_executable() -> Option<String> {
         r"C:\Program Files (x86)\Git\bin\bash.exe",
     ];
     for p in &standard_paths {
-        if Path::new(p).exists() {
+        if Path::new(p).exists() && bash_executable_is_usable(Path::new(p)) {
             info!("Found system bash at: {}", p);
             return Some(p.to_string());
         }
@@ -3622,12 +3714,14 @@ pub fn find_bash_executable() -> Option<String> {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(line) = stdout.lines().next() {
-                    let path = line.trim().to_string();
-                    if !path.is_empty() && Path::new(&path).exists() {
-                        info!("Found bash on PATH: {}", path);
-                        return Some(path);
-                    }
+                if let Some(path) =
+                    first_usable_windows_bash_candidate(&stdout, bash_executable_is_usable)
+                {
+                    info!("Found native bash on PATH: {}", path);
+                    return Some(path);
+                }
+                if stdout.lines().any(is_windows_bash_launcher) {
+                    info!("Ignoring Windows WSL bash launcher; PortableGit is required instead");
                 }
             }
         }
@@ -3645,13 +3739,74 @@ fn download_portable_git() -> std::result::Result<String, String> {
     let local_app_data =
         std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA env var not set".to_string())?;
     let screenpipe_dir = PathBuf::from(&local_app_data).join("screenpipe");
+    download_portable_git_into(&screenpipe_dir)
+}
+
+#[cfg(windows)]
+fn retry_transient_windows_file_lock(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if (error.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(error.raw_os_error(), Some(32 | 33)))
+                    && std::time::Instant::now() < deadline =>
+            {
+                // Git Bash under Windows-on-ARM emulation and endpoint security
+                // may briefly retain image handles after the startup probe exits.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rename_directory_with_retry(source: &Path, destination: &Path) -> std::io::Result<()> {
+    retry_transient_windows_file_lock(|| std::fs::rename(source, destination))
+}
+
+#[cfg(windows)]
+fn remove_directory_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_file_lock(|| match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    })
+}
+
+#[cfg(windows)]
+fn remove_file_with_retry(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_file_lock(|| match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    })
+}
+
+#[cfg(windows)]
+fn download_portable_git_into(screenpipe_dir: &Path) -> std::result::Result<String, String> {
+    static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _install_guard = INSTALL_LOCK
+        .lock()
+        .map_err(|_| "PortableGit install lock was poisoned".to_string())?;
+
     let git_dir = screenpipe_dir.join("git-portable");
     let bash_path = git_dir.join("bin").join("bash.exe");
 
     // Already downloaded
-    if bash_path.exists() {
+    if bash_path.exists() && bash_executable_is_usable(&bash_path) {
         info!("PortableGit already present at {}", git_dir.display());
         return Ok(bash_path.to_string_lossy().to_string());
+    }
+    if git_dir.exists() {
+        warn!(
+            "PortableGit at {} is incomplete or failed its startup probe; reinstalling it",
+            git_dir.display()
+        );
+        remove_directory_with_retry(&git_dir)
+            .map_err(|e| format!("Failed to remove broken PortableGit install: {}", e))?;
     }
 
     // Pinned version for reproducibility
@@ -3670,9 +3825,17 @@ fn download_portable_git() -> std::result::Result<String, String> {
         .map_err(|e| format!("Failed to create screenpipe data dir: {}", e))?;
 
     // Download to temp file
+    let unique_suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("System clock is before Unix epoch: {}", e))?
+            .as_nanos()
+    );
     let temp_file = std::env::temp_dir().join(format!(
-        "PortableGit-{}-64-bit.7z.exe",
-        PORTABLE_GIT_VERSION
+        "PortableGit-{}-{}.7z.exe",
+        PORTABLE_GIT_VERSION, unique_suffix
     ));
 
     // Use bun or curl to download (bun is always available since we bundle it)
@@ -3708,7 +3871,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let _ = std::fs::remove_file(&temp_file);
+            let _ = remove_file_with_retry(&temp_file);
             return Err(format!("PortableGit download failed: {}", stderr));
         }
         Err(e) => {
@@ -3725,8 +3888,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
     info!("Extracting PortableGit to {}...", git_dir.display());
 
     // Extract to a temp directory first (atomic: rename on success)
-    let extract_temp = screenpipe_dir.join("git-portable-extracting");
-    let _ = std::fs::remove_dir_all(&extract_temp);
+    let extract_temp = screenpipe_dir.join(format!("git-portable-extracting-{}", unique_suffix));
 
     {
         let mut cmd = std::process::Command::new(&temp_file);
@@ -3746,13 +3908,13 @@ fn download_portable_git() -> std::result::Result<String, String> {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let _ = std::fs::remove_dir_all(&extract_temp);
-                let _ = std::fs::remove_file(&temp_file);
+                let _ = remove_directory_with_retry(&extract_temp);
+                let _ = remove_file_with_retry(&temp_file);
                 return Err(format!("PortableGit extraction failed: {}", stderr));
             }
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&extract_temp);
-                let _ = std::fs::remove_file(&temp_file);
+                let _ = remove_directory_with_retry(&extract_temp);
+                let _ = remove_file_with_retry(&temp_file);
                 return Err(format!("Failed to run PortableGit extractor: {}", e));
             }
         }
@@ -3761,8 +3923,8 @@ fn download_portable_git() -> std::result::Result<String, String> {
     // Verify extraction produced bash.exe
     let extracted_bash = extract_temp.join("bin").join("bash.exe");
     if !extracted_bash.exists() {
-        let _ = std::fs::remove_dir_all(&extract_temp);
-        let _ = std::fs::remove_file(&temp_file);
+        let _ = remove_directory_with_retry(&extract_temp);
+        let _ = remove_file_with_retry(&temp_file);
         return Err("Extraction completed but bash.exe not found in expected location".to_string());
     }
 
@@ -3792,10 +3954,21 @@ fn download_portable_git() -> std::result::Result<String, String> {
         }
     }
 
+    if !bash_executable_is_usable(&extracted_bash) {
+        let _ = remove_directory_with_retry(&extract_temp);
+        let _ = remove_file_with_retry(&temp_file);
+        return Err("Extracted PortableGit bash.exe failed its startup probe".to_string());
+    }
+
     // Atomic rename: move extracted dir to final location
-    let _ = std::fs::remove_dir_all(&git_dir);
-    std::fs::rename(&extract_temp, &git_dir).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&extract_temp);
+    if git_dir.exists() {
+        remove_directory_with_retry(&git_dir).map_err(|e| {
+            let _ = remove_directory_with_retry(&extract_temp);
+            format!("Failed to clear PortableGit destination: {}", e)
+        })?;
+    }
+    rename_directory_with_retry(&extract_temp, &git_dir).map_err(|e| {
+        let _ = remove_directory_with_retry(&extract_temp);
         format!(
             "Failed to move extracted PortableGit to final location: {}",
             e
@@ -3803,7 +3976,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
     })?;
 
     // Clean up temp download
-    let _ = std::fs::remove_file(&temp_file);
+    let _ = remove_file_with_retry(&temp_file);
 
     let final_bash = git_dir.join("bin").join("bash.exe");
     info!(
@@ -4048,7 +4221,7 @@ static BASH_DIR_ONCE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock:
 /// Returns the bash bin directory (for PATH injection) or None.
 #[cfg(windows)]
 pub fn ensure_bash_available() -> Option<String> {
-    // Fast path: if bash is already on disk, return immediately without touching OnceLock.
+    // Fast path: if bash is healthy, return immediately without touching OnceLock.
     // This avoids caching a stale "not found" from a previous failed attempt.
     if let Some(bash_path) = find_bash_executable() {
         return Path::new(&bash_path)
@@ -4085,8 +4258,137 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_bash_launcher_detection_rejects_wsl_shims() {
+        assert!(is_windows_bash_launcher(r#"C:\Windows\System32\bash.exe"#));
+        assert!(is_windows_bash_launcher(r#"C:\Windows\Sysnative\bash.exe"#));
+        assert!(is_windows_bash_launcher(r#"C:\Windows\SysWOW64\bash.exe"#));
+        assert!(is_windows_bash_launcher(
+            r#"C:\Users\steve\AppData\Local\Microsoft\WindowsApps\bash.exe"#
+        ));
+        assert!(is_windows_bash_launcher(
+            r#""C:/WINDOWS/System32/BASH.EXE""#
+        ));
+        assert!(!is_windows_bash_launcher(
+            r#"C:\Program Files\Git\bin\bash.exe"#
+        ));
+    }
+
+    #[test]
+    fn windows_bash_candidate_skips_wsl_and_uses_native_shell() {
+        let candidates = [
+            r#"C:\Windows\System32\bash.exe"#,
+            r#"C:\Program Files\Git\bin\bash.exe"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            first_usable_windows_bash_candidate(&candidates, |_| true).as_deref(),
+            Some(r#"C:\Program Files\Git\bin\bash.exe"#)
+        );
+    }
+
+    #[test]
+    fn windows_bash_candidate_skips_unusable_native_candidates() {
+        let candidates = [
+            r#"C:\tools\broken\bash.exe"#,
+            r#"C:\Windows\SysWOW64\bash.exe"#,
+            r#"C:\custom tools\git\bin\bash.exe"#,
+        ]
+        .join("\r\n");
+
+        assert_eq!(
+            first_usable_windows_bash_candidate(&candidates, |path| {
+                path == Path::new(r#"C:\custom tools\git\bin\bash.exe"#)
+            })
+            .as_deref(),
+            Some(r#"C:\custom tools\git\bin\bash.exe"#)
+        );
+    }
+
+    #[test]
+    fn windows_bash_candidate_rejects_wsl_only_output() {
+        let candidates = [
+            r#"C:\Windows\System32\bash.exe"#,
+            r#"C:\Users\steve\AppData\Local\Microsoft\WindowsApps\bash.exe"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            first_usable_windows_bash_candidate(&candidates, |_| true),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "network-backed acceptance test for disposable Windows VMs"]
+    fn portable_git_fresh_install_and_broken_install_repair() {
+        let root = std::env::temp_dir().join(format!(
+            "screenpipe-portable-git-test-{}",
+            std::process::id()
+        ));
+        let screenpipe_dir = root.join("screenpipe");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let first = download_portable_git_into(&screenpipe_dir)
+            .expect("fresh PortableGit install should succeed");
+        assert!(bash_executable_is_usable(Path::new(&first)));
+
+        retry_transient_windows_file_lock(|| std::fs::write(&first, b"broken portable git"))
+            .expect("test should corrupt the managed bash executable");
+        assert!(!bash_executable_is_usable(Path::new(&first)));
+
+        let repaired = download_portable_git_into(&screenpipe_dir)
+            .expect("broken managed PortableGit install should be replaced");
+        assert_eq!(repaired, first);
+        assert!(bash_executable_is_usable(Path::new(&repaired)));
+
+        remove_file_with_retry(Path::new(&repaired))
+            .expect("test should remove bash from the managed install");
+        let repaired_incomplete = download_portable_git_into(&screenpipe_dir)
+            .expect("incomplete managed PortableGit install should be replaced");
+        assert_eq!(repaired_incomplete, first);
+        assert!(bash_executable_is_usable(Path::new(&repaired_incomplete)));
+
+        remove_directory_with_retry(&root).expect("test should clean up its PortableGit install");
+    }
+
+    #[test]
     fn managed_pi_install_disables_dependency_lifecycle_scripts() {
         assert!(PI_INSTALL_ARGS.contains(&"--ignore-scripts"));
+    }
+
+    #[test]
+    fn managed_pi_install_rematerializes_declared_dependencies() {
+        assert_eq!(PI_INSTALL_ARGS[0], "install");
+        assert!(PI_INSTALL_ARGS.contains(&"--force"));
+    }
+
+    #[test]
+    fn seed_pi_package_json_pins_managed_runtime_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        seed_pi_package_json(dir.path()).expect("seed managed manifest");
+
+        let contents = std::fs::read_to_string(dir.path().join("package.json"))
+            .expect("seeded package.json readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&contents).expect("seeded package.json parses");
+        let dependencies = parsed["dependencies"]
+            .as_object()
+            .expect("managed dependencies object");
+        assert_eq!(
+            dependencies.get("@earendil-works/pi-coding-agent"),
+            Some(&json!(PI_PACKAGE.rsplit('@').next().unwrap_or("")))
+        );
+        assert_eq!(
+            dependencies.get("@earendil-works/pi-ai"),
+            Some(&json!(PI_AI_PACKAGE.rsplit('@').next().unwrap_or("")))
+        );
+        assert_eq!(
+            dependencies.get("@anthropic-ai/sdk"),
+            Some(&json!("^0.91.1"))
+        );
     }
 
     #[test]
@@ -5589,7 +5891,7 @@ mod tests {
         .expect("write corrupt pkg");
         std::fs::write(&lock_path, b"stale-lock").expect("write stale lock");
 
-        seed_pi_package_json(dir.path());
+        seed_pi_package_json(dir.path()).expect("recover managed manifest");
 
         let contents = std::fs::read_to_string(&pkg_path).expect("re-seeded pkg readable");
         assert!(

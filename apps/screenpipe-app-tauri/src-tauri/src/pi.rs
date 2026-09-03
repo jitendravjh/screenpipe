@@ -255,12 +255,13 @@ static REQUIRED_PI_PACKAGE_INSTALL_LOCK: std::sync::OnceLock<Mutex<()>> =
 static PI_EXTENSION_SAFE_MODE_PROJECTS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::OnceLock::new();
 
-const MANAGED_PI_EXTENSION_FILES: [&str; 5] = [
+const MANAGED_PI_EXTENSION_FILES: [&str; 6] = [
     "web-search.ts",
     "mcp-bridge.ts",
     "save-artifact.ts",
     "live-views.ts",
     "connection-gate.ts",
+    "context-pruning.ts",
 ];
 
 fn extension_safe_mode_projects() -> &'static std::sync::Mutex<HashSet<String>> {
@@ -1790,6 +1791,14 @@ fn ensure_context_usage_extension(project_dir: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to install context-usage extension: {}", e))
 }
 
+/// Install Screenpipe's context guard so native Pi chat and pi-acp use the
+/// same bounded pruning and provider-overflow recovery as background pipes.
+fn ensure_context_pruning_extension(project_dir: &str) -> Result<(), String> {
+    use screenpipe_core::agents::pi::PiExecutor;
+    PiExecutor::ensure_context_pruning_extension(std::path::Path::new(project_dir))
+        .map_err(|e| format!("Failed to install context-pruning extension: {}", e))
+}
+
 /// Every extension both Pi harnesses must load. Native Pi and pi-acp run the
 /// SAME pi binary against the same project dir, so an extension seeded on one
 /// path and not the other is always a bug — and the two lists drifted once
@@ -1801,6 +1810,7 @@ fn ensure_shared_pi_extensions(project_dir: &str) -> Result<(), String> {
     ensure_self_improvement_extension(project_dir)?;
     ensure_chat_control_extension(project_dir)?;
     ensure_context_usage_extension(project_dir)?;
+    ensure_context_pruning_extension(project_dir)?;
     // MCP bridge: lets the agent reach user-registered MCP servers.
     ensure_mcp_bridge_extension(project_dir)?;
     // Save artifact: lets the agent register deliverables in the Artifacts library.
@@ -1821,6 +1831,7 @@ const SHARED_PI_EXTENSION_FILES: &[&str] = &[
     "self-improvement.ts",
     "chat-control.ts",
     "context-usage.ts",
+    "context-pruning.ts",
     "mcp-bridge.ts",
     "save-artifact.ts",
     "live-views.ts",
@@ -4198,7 +4209,7 @@ async fn resolve_user_mcp_servers_json() -> Option<String> {
     let servers = store.list().await.ok()?;
     let mut out = Vec::new();
     for cfg in servers {
-        if !cfg.enabled || cfg.name.eq_ignore_ascii_case("screenpipe") {
+        if !cfg.enabled || screenpipe_connect::mcp_servers::is_screenpipe_mcp_config(&cfg) {
             continue;
         }
         let is_stdio = matches!(cfg.transport, McpTransport::Stdio);
@@ -4470,6 +4481,68 @@ pub(crate) async fn pi_queue_prompt_inner(
     Ok(queue_id)
 }
 
+/// Queue a prompt and expose a terminal receipt for backend workflows that
+/// must distinguish "accepted" from "finished". The normal composer keeps
+/// using `pi_queue_prompt_inner`, which intentionally returns immediately.
+pub(crate) async fn pi_queue_prompt_tracked_inner(
+    app: &AppHandle,
+    state: &PiState,
+    sid: &str,
+    message: String,
+    display_preview: Option<String>,
+) -> Result<
+    (
+        String,
+        oneshot::Receiver<Result<(), String>>,
+    ),
+    String,
+> {
+    let mut conversation = acquire_pi_conversation_lease(state, sid).await?;
+    let message = conversation.prepare_prompt(message);
+    let preview = display_preview.unwrap_or_else(|| message.clone());
+    let message = attach_foreground_connections_context(app, sid, message).await;
+    #[cfg(feature = "e2e")]
+    emit_e2e_pi_wire_prompt(app, sid, "queue", &message);
+    let cmd = build_prompt_command(message, None, &preview)?;
+    let (queue_id, acceptance_rx, completion_rx) = conversation
+        .queue
+        .send_prompt_tracked(
+            cmd,
+            crate::pi_command_queue::WaitMode::Prompt,
+            preview,
+            true,
+        )
+        .await?;
+
+    let state_for_watchdog = state.clone();
+    let sid_for_watchdog = sid.to_string();
+    if conversation.is_synced() {
+        drop(conversation);
+        tokio::spawn(async move {
+            if let Err(error) =
+                await_prompt_start(&state_for_watchdog, &sid_for_watchdog, acceptance_rx).await
+            {
+                warn!(
+                    "tracked Pi prompt failed before it started for session {}: {}",
+                    sid_for_watchdog, error
+                );
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            match await_prompt_start(&state_for_watchdog, &sid_for_watchdog, acceptance_rx).await {
+                Ok(()) => conversation.mark_synced(),
+                Err(error) => warn!(
+                    "tracked Pi prompt failed before it started for session {}: {}",
+                    sid_for_watchdog, error
+                ),
+            }
+        });
+    }
+
+    Ok((queue_id, completion_rx))
+}
+
 /// Steer the active Pi reply using Pi's native steering command.
 /// Unlike `pi_prompt`, this is intentionally not added to the follow-up queue:
 /// Pi interrupts the current stream and resumes with the steering instruction.
@@ -4561,11 +4634,19 @@ pub async fn pi_cancel_queued(
     prompt_id: String,
 ) -> Result<bool, String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    pi_cancel_queued_inner(state.inner(), &sid, prompt_id).await
+}
+
+pub(crate) async fn pi_cancel_queued_inner(
+    state: &PiState,
+    sid: &str,
+    prompt_id: String,
+) -> Result<bool, String> {
     let queue = {
         let pool = state.0.lock().await;
         let m = pool
             .sessions
-            .get(&sid)
+            .get(sid)
             .ok_or("session not found".to_string())?;
         m.queue_handle
             .clone()
@@ -4659,9 +4740,13 @@ pub async fn pi_abort_active(
     session_id: Option<String>,
 ) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    pi_abort_active_inner(state.inner(), &sid).await
+}
+
+pub(crate) async fn pi_abort_active_inner(state: &PiState, sid: &str) -> Result<(), String> {
     let queue = {
         let mut pool = state.0.lock().await;
-        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        let m = pool.sessions.get_mut(sid).ok_or("Pi not initialized")?;
         if !m.is_running() {
             return Err("Pi is not running".to_string());
         }
@@ -7727,6 +7812,7 @@ error: InstallFailed extracting tarball"#;
         let header = "// screenpipe — AI that knows everything you've seen, said, or heard\n";
         std::fs::write(extension_dir.join("mcp-bridge.ts"), header).unwrap();
         std::fs::write(extension_dir.join("live-views.ts"), header).unwrap();
+        std::fs::write(extension_dir.join("context-pruning.ts"), header).unwrap();
         std::fs::write(extension_dir.join("third-party.ts"), header).unwrap();
 
         let mut command = Command::new("pi");
@@ -7737,9 +7823,10 @@ error: InstallFailed extracting tarball"#;
             .collect::<Vec<_>>();
 
         assert_eq!(args[0], "--no-extensions");
-        assert_eq!(args.iter().filter(|arg| *arg == "--extension").count(), 2);
+        assert_eq!(args.iter().filter(|arg| *arg == "--extension").count(), 3);
         assert!(args.iter().any(|arg| arg.ends_with("mcp-bridge.ts")));
         assert!(args.iter().any(|arg| arg.ends_with("live-views.ts")));
+        assert!(args.iter().any(|arg| arg.ends_with("context-pruning.ts")));
         assert!(!args.iter().any(|arg| arg.ends_with("third-party.ts")));
     }
 
@@ -8214,5 +8301,13 @@ error: InstallFailed extracting tarball"#;
             super::SHARED_PI_EXTENSION_FILES.contains(&"context-usage.ts"),
             "context-usage must stay in the shared set so pi-acp keeps the breakdown"
         );
+        assert!(
+            super::SHARED_PI_EXTENSION_FILES.contains(&"context-pruning.ts"),
+            "context-pruning must stay in the shared set for native Pi and pi-acp"
+        );
+        let pruning = std::fs::read_to_string(ext_dir.join("context-pruning.ts"))
+            .expect("read seeded context-pruning extension");
+        assert!(pruning.contains("normalizeContextOverflowError"));
+        assert!(pruning.contains("PROACTIVE_COMPACTION_PERCENT = 70"));
     }
 }

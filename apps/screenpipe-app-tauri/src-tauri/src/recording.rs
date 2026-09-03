@@ -170,7 +170,22 @@ fn server_access_policy(
     has_verified_local_plan
 }
 
-pub(crate) fn server_access_allowed(store: &SettingsStore) -> bool {
+pub(crate) fn server_access_allowed(app: &tauri::AppHandle, store: &SettingsStore) -> bool {
+    let startup_authentication = app
+        .try_state::<crate::startup_auth::AuthenticationStatus>()
+        .map(|status| *status)
+        .unwrap_or(crate::startup_auth::AuthenticationStatus::LoggedOut);
+    let authenticated_after_startup = if cfg!(feature = "enterprise-build") {
+        crate::enterprise_policy::recording_authorized()
+    } else {
+        store.has_cloud_authentication()
+    };
+    if startup_authentication == crate::startup_auth::AuthenticationStatus::LoggedOut
+        && !authenticated_after_startup
+    {
+        return false;
+    }
+
     server_access_policy(
         cfg!(feature = "enterprise-build"),
         cfg!(debug_assertions),
@@ -230,8 +245,8 @@ fn require_recording_access(app: &tauri::AppHandle, store: &SettingsStore) -> Re
     Err("account_required: sign in to start screenpipe recording".to_string())
 }
 
-fn require_server_access(store: &SettingsStore) -> Result<(), String> {
-    if server_access_allowed(store) {
+fn require_server_access(app: &tauri::AppHandle, store: &SettingsStore) -> Result<(), String> {
+    if server_access_allowed(app, store) {
         return Ok(());
     }
 
@@ -938,7 +953,7 @@ pub async fn spawn_screenpipe(
     // A summary-paywall install still needs the long-lived local read server
     // for Timeline, but it must not publish capture intent or restart capture.
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    require_server_access(&store)?;
+    require_server_access(&app, &store)?;
     let capture_allowed = recording_access_allowed(&app, &store);
 
     // Normal starts publish capture intent before touching lifecycle state.
@@ -1023,7 +1038,7 @@ async fn spawn_screenpipe_inner(
     }
 
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
-    if let Err(err) = require_server_access(&store) {
+    if let Err(err) = require_server_access(&app, &store) {
         state.is_starting.store(false, Ordering::SeqCst);
         state.is_starting_capture.store(false, Ordering::SeqCst);
         return Err(err);
@@ -1369,6 +1384,7 @@ async fn spawn_screenpipe_inner(
     // topic with either a per-run or stable continued session id (see the matching
     // helper in `apps/screenpipe-app-tauri/lib/events/types.ts`).
     let app_for_pipe = app.clone();
+    let app_for_chat_destination = app.clone();
     let app_for_owned = app.clone();
     let app_for_port_conflict = app.clone();
 
@@ -1390,6 +1406,12 @@ async fn spawn_screenpipe_inner(
             pipe_agent_events.emit_line(pipe_name, exec_id, continues_chat, line);
         }),
     );
+    let chat_destination: Option<
+        screenpipe_core::agents::chat_destination::ChatDestinationDispatch,
+    > = Some(std::sync::Arc::new(move |request| {
+        let app = app_for_chat_destination.clone();
+        Box::pin(async move { crate::chat_control::run_pipe_in_existing_chat(&app, request).await })
+    }));
 
     // Oneshot for result
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -1418,6 +1440,7 @@ async fn spawn_screenpipe_inner(
                 let server = match ServerCore::start(
                     &recording_config,
                     on_pipe_output,
+                    chat_destination,
                     Some(owned_browser),
                     cloud_token_arc.clone(),
                     history_access.clone(),
